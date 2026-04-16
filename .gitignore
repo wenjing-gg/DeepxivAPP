@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+.venv/
+renderer/dist/
+release/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
