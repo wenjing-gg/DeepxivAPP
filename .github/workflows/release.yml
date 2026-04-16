@@ -17,12 +17,10 @@ jobs:
         include:
           - os: macos-latest
             npm_script: dist:mac
-            asset_glob: release/*.zip
+            asset_glob: release/*.dmg
           - os: windows-latest
             npm_script: dist:win
-            asset_glob: |
-              release/*.exe
-              release/*.zip
+            asset_glob: release/*.exe
 
     runs-on: ${{ matrix.os }}
 

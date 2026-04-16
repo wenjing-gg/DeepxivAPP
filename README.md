@@ -1,4 +1,4 @@
-# DeepxivAPP
+# DeepXiv Client
 
 这是一个基于 **Electron + React + Vite + Python bridge** 的 DeepXiv 桌面客户端项目，面向论文搜索、阅读、收藏、本地 PDF 管理与 AI 论文助手场景。
 
@@ -17,7 +17,7 @@
 - 论文详情阅读与应用内 PDF 阅读
 - 收藏、最近访问、分组管理、本地 PDF 导入
 - AI 论文助手，对当前论文进行上下文问答
-- Electron 桌面封装，支持发布 macOS / Windows 安装包
+- Electron 桌面封装，支持发布 macOS `dmg` 与 Windows `exe` 安装包
 
 ## 项目结构
 
@@ -41,7 +41,10 @@ npm run dist:mac
 npm run dist:win
 ```
 
-打包结果默认输出到 `release/`。
+打包结果默认输出到 `release/`：
+
+- macOS：`dmg`
+- Windows：`exe` 安装包
 
 ## 发布说明
 
