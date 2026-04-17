@@ -521,12 +521,23 @@ async function callBridge(command, payload = {}) {
   const bridge = bridgePath();
   return new Promise((resolve, reject) => {
     execFile(python, [bridge, command, JSON.stringify(payload)], { cwd: appRoot(), timeout: 120000 }, (error, stdout, stderr) => {
+      const trimmed = String(stdout || '').trim();
+      const lines = trimmed ? trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
+      const candidate = lines.length ? lines[lines.length - 1] : trimmed;
+      let parsed = null;
+      if (candidate) {
+        try {
+          parsed = JSON.parse(candidate);
+        } catch (parseError) {
+          parsed = null;
+        }
+      }
       if (error) {
-        reject(new Error(stderr.trim() || stdout.trim() || error.message));
+        reject(new Error(parsed?.error || stderr.trim() || trimmed || error.message));
         return;
       }
       try {
-        const response = JSON.parse(stdout);
+        const response = parsed || JSON.parse(candidate || '{}');
         if (!response.ok) {
           reject(new Error(response.error || '请求失败'));
           return;

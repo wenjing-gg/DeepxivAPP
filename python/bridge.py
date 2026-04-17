@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+import ssl
+import struct
 import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+import requests
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
 from deepxiv_sdk import Reader
-from deepxiv_sdk.cli import auto_register_token, ensure_token, get_token, save_token
+from deepxiv_sdk.cli import DEFAULT_DAILY_LIMIT, SDK_REGISTER_ENDPOINT, ensure_token, generate_registration_payload, get_token, save_token
 
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -54,11 +58,189 @@ def token_summary() -> Dict[str, Any]:
     return {"has_token": bool(token), "token": token or "", "masked": masked}
 
 
+def simplify_registration_error(message: str) -> str:
+    text = normalize_spaces(message)
+    if not text:
+        return "匿名注册失败，请稍后重试"
+    lowered = text.lower()
+    if "failed to resolve" in lowered or "nameresolutionerror" in lowered or "nodename nor servname provided" in lowered:
+        return "匿名注册服务当前无法解析，请检查网络连接后重试"
+    if "max retries exceeded" in lowered or "httpsconnectionpool" in lowered or "connection aborted" in lowered:
+        return "匿名注册服务当前不可达，请稍后重试"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "匿名注册请求超时，请稍后重试"
+    return "匿名注册失败，请稍后重试"
+
+
+def read_dns_name_end(payload: bytes, offset: int) -> int:
+    while True:
+        if offset >= len(payload):
+            raise ValueError("DNS 响应格式异常")
+        length = payload[offset]
+        if length == 0:
+            return offset + 1
+        if length & 0xC0 == 0xC0:
+            return offset + 2
+        offset += 1 + length
+
+
+def build_dns_query(host: str, query_id: int = 0x2D58) -> bytes:
+    header = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+    labels = b"".join(len(part).to_bytes(1, "big") + part.encode("utf-8") for part in host.split(".")) + b"\x00"
+    return header + labels + struct.pack("!HH", 1, 1)
+
+
+def parse_dns_response(payload: bytes, query_id: int = 0x2D58) -> List[str]:
+    if len(payload) < 12:
+        raise ValueError("DNS 响应过短")
+    response_id, _flags, question_count, answer_count, _authority_count, _additional_count = struct.unpack("!HHHHHH", payload[:12])
+    if response_id != query_id:
+        raise ValueError("DNS 响应 ID 不匹配")
+    offset = 12
+    for _ in range(question_count):
+        offset = read_dns_name_end(payload, offset)
+        offset += 4
+    results: List[str] = []
+    for _ in range(answer_count):
+        offset = read_dns_name_end(payload, offset)
+        if offset + 10 > len(payload):
+            raise ValueError("DNS Answer 结构不完整")
+        answer_type, answer_class, _ttl, data_length = struct.unpack("!HHIH", payload[offset:offset + 10])
+        offset += 10
+        if offset + data_length > len(payload):
+            raise ValueError("DNS Answer 数据不完整")
+        data = payload[offset:offset + data_length]
+        offset += data_length
+        if answer_type == 1 and answer_class == 1 and data_length == 4:
+            results.append(".".join(str(part) for part in data))
+    return results
+
+
+def resolve_ipv4_via_public_dns(host: str) -> List[str]:
+    last_error: Optional[Exception] = None
+    query_id = 0x2D58
+    query = build_dns_query(host, query_id)
+    for resolver in ("223.5.5.5", "1.1.1.1", "8.8.8.8"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        try:
+            sock.sendto(query, (resolver, 53))
+            payload, _ = sock.recvfrom(2048)
+            results = parse_dns_response(payload, query_id)
+            if results:
+                return results
+        except Exception as exc:
+            last_error = exc
+        finally:
+            sock.close()
+    raise RuntimeError(f"公共 DNS 解析失败: {last_error}")
+
+
+def decode_chunked_http(body: bytes) -> bytes:
+    offset = 0
+    chunks = []
+    while True:
+        line_end = body.find(b"\r\n", offset)
+        if line_end < 0:
+            raise ValueError("Chunked 响应格式异常")
+        size_text = body[offset:line_end].split(b";", 1)[0].strip()
+        size = int(size_text or b"0", 16)
+        offset = line_end + 2
+        if size == 0:
+            return b"".join(chunks)
+        chunk = body[offset:offset + size]
+        chunks.append(chunk)
+        offset += size + 2
+
+
+def read_http_response(sock: ssl.SSLSocket) -> tuple[int, Dict[str, str], bytes]:
+    chunks = []
+    while True:
+        data = sock.recv(4096)
+        if not data:
+            break
+        chunks.append(data)
+    raw = b"".join(chunks)
+    header_bytes, _, body = raw.partition(b"\r\n\r\n")
+    if not header_bytes:
+        raise ValueError("HTTP 响应头缺失")
+    header_text = header_bytes.decode("iso-8859-1", errors="replace")
+    lines = header_text.split("\r\n")
+    status_line = lines[0].split()
+    status_code = int(status_line[1]) if len(status_line) > 1 else 0
+    headers: Dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        body = decode_chunked_http(body)
+    return status_code, headers, body
+
+
+def register_token_via_resolved_ip(payload: Dict[str, Any]) -> Dict[str, Any]:
+    endpoint = urlsplit(SDK_REGISTER_ENDPOINT)
+    host = endpoint.hostname or "data.rag.ac.cn"
+    port = endpoint.port or 443
+    path = endpoint.path or "/api/register/sdk"
+    if endpoint.query:
+        path = f"{path}?{endpoint.query}"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_error: Optional[Exception] = None
+    for ip in resolve_ipv4_via_public_dns(host):
+        try:
+            with socket.create_connection((ip, port), timeout=15) as tcp_sock:
+                context = ssl.create_default_context()
+                with context.wrap_socket(tcp_sock, server_hostname=host) as tls_sock:
+                    request = (
+                        f"POST {path} HTTP/1.1\r\n"
+                        f"Host: {host}\r\n"
+                        "User-Agent: DeepXiv-Desktop/1.0\r\n"
+                        "Accept: application/json\r\n"
+                        "Content-Type: application/json\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("utf-8")
+                    tls_sock.sendall(request + body)
+                    status_code, _headers, response_body = read_http_response(tls_sock)
+            if status_code >= 400:
+                raise RuntimeError(f"HTTP {status_code}")
+            return json.loads(response_body.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"匿名注册服务当前不可达: {last_error}")
+
+
+def perform_sdk_registration(payload: Dict[str, Any]) -> Dict[str, Any]:
+    response = requests.post(SDK_REGISTER_ENDPOINT, json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
 def register_token() -> Dict[str, Any]:
     ensure_home_dir()
-    token, daily_limit = auto_register_token()
+    payload = generate_registration_payload()
+    try:
+        result = perform_sdk_registration(payload)
+    except requests.exceptions.RequestException as primary_error:
+        try:
+            result = register_token_via_resolved_ip(payload)
+        except Exception as fallback_error:
+            raise RuntimeError(simplify_registration_error(f"{primary_error}; {fallback_error}"))
+    except ValueError as exc:
+        raise RuntimeError("匿名注册服务返回了无法解析的数据") from exc
+
+    if not result.get("success"):
+        raise RuntimeError(normalize_spaces(result.get("message")) or "匿名注册失败，请稍后重试")
+
+    data = result.get("data", {})
+    token = str(data.get("token") or "").strip()
+    daily_limit = data.get("daily_limit", DEFAULT_DAILY_LIMIT)
     if not token:
-        raise RuntimeError("匿名注册失败，请稍后重试")
+        raise RuntimeError("匿名注册成功，但服务未返回 token")
+
+    save_token(token, is_global=True)
     summary = token_summary()
     summary["daily_limit"] = daily_limit
     return summary
