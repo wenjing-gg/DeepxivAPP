@@ -32,9 +32,10 @@ case "$PYTHON_VERSION" in
     ;;
 esac
 
+rm -rf "$ROOT_DIR/.venv"
 "$PYTHON_BIN" -m venv "$ROOT_DIR/.venv"
 source "$ROOT_DIR/.venv/bin/activate"
 python -m pip install --upgrade pip
-python -m pip install -r "$ROOT_DIR/requirements.txt"
+python -m pip install --no-cache-dir -r "$ROOT_DIR/requirements.txt"
 
 echo "Python backend ready at $ROOT_DIR/.venv"

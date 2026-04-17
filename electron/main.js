@@ -58,13 +58,38 @@ function pythonCandidates() {
     path.join(root, '.venv', 'Scripts', 'python3.exe'),
     path.join(root, '.venv', 'bin', 'python3'),
     path.join(root, '.venv', 'bin', 'python'),
+    '/opt/homebrew/bin/python3',
+    '/usr/local/bin/python3',
+    '/usr/bin/python3',
     'python3',
     'python'
   ].filter(Boolean);
 }
 
+function bundledBridgeCandidates() {
+  const bridgeDir = path.join(appRoot(), 'bridge');
+  return process.platform === 'win32'
+    ? [path.join(bridgeDir, 'deepxiv-bridge.exe')]
+    : [path.join(bridgeDir, 'deepxiv-bridge')];
+}
+
 function bridgePath() {
   return path.join(appRoot(), 'python', 'bridge.py');
+}
+
+async function findBundledBridge() {
+  for (const candidate of bundledBridgeCandidates()) {
+    try {
+      if (process.platform === 'win32') {
+        await fsp.access(candidate, fs.constants.F_OK);
+      } else {
+        await fsp.access(candidate, fs.constants.X_OK);
+      }
+      return candidate;
+    } catch (error) {
+    }
+  }
+  return null;
 }
 
 function clone(value) {
@@ -505,22 +530,41 @@ function formatAiConnectivityError(baseUrl, error) {
 async function findPython() {
   for (const candidate of pythonCandidates()) {
     try {
-      await fsp.access(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch (error) {
-      if (candidate === 'python3' || candidate === 'python') {
+      if (candidate.includes(path.sep)) {
+        await fsp.access(candidate, fs.constants.X_OK);
         return candidate;
       }
+
+      await new Promise((resolve, reject) => {
+        execFile(candidate, ['--version'], { timeout: 5000 }, (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+      return candidate;
+    } catch (error) {
     }
   }
   throw new Error('未找到可用的 Python 解释器');
 }
 
 async function callBridge(command, payload = {}) {
-  const python = await findPython();
-  const bridge = bridgePath();
+  const bundledBridge = await findBundledBridge();
+  const useBundledBridge = app.isPackaged || Boolean(bundledBridge);
+  if (useBundledBridge && !bundledBridge) {
+    throw new Error('内置服务组件缺失，请重新安装最新版客户端');
+  }
+
+  const executable = useBundledBridge ? bundledBridge : await findPython();
+  const args = useBundledBridge
+    ? [command, JSON.stringify(payload)]
+    : [bridgePath(), command, JSON.stringify(payload)];
+
   return new Promise((resolve, reject) => {
-    execFile(python, [bridge, command, JSON.stringify(payload)], { cwd: appRoot(), timeout: 120000 }, (error, stdout, stderr) => {
+    execFile(executable, args, { cwd: appRoot(), timeout: 120000 }, (error, stdout, stderr) => {
       const trimmed = String(stdout || '').trim();
       const lines = trimmed ? trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
       const candidate = lines.length ? lines[lines.length - 1] : trimmed;
@@ -533,7 +577,12 @@ async function callBridge(command, payload = {}) {
         }
       }
       if (error) {
-        reject(new Error(parsed?.error || stderr.trim() || trimmed || error.message));
+        const rawError = parsed?.error || stderr.trim() || trimmed || error.message;
+        if (!useBundledBridge && /ENOENT|not found|spawn .*python/i.test(String(error.message || rawError))) {
+          reject(new Error('未找到可用的 Python 运行环境；请安装 Python 3.10+，或使用正式安装包版本'));
+          return;
+        }
+        reject(new Error(rawError));
         return;
       }
       try {

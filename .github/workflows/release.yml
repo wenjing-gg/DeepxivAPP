@@ -64,6 +64,21 @@ jobs:
           python python/bridge.py save-token '{"token":"ci-smoke-token"}'
           python python/bridge.py token-status '{}'
 
+      - name: Build bundled bridge (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: npm run bridge:build
+
+      - name: Smoke test bundled bridge (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export HOME="$RUNNER_TEMP/deepxiv-home-bundled"
+          mkdir -p "$HOME"
+          ./bridge-dist/deepxiv-bridge token-status '{}'
+          ./bridge-dist/deepxiv-bridge save-token '{"token":"ci-bundled-token"}'
+          ./bridge-dist/deepxiv-bridge token-status '{}'
+
       - name: Create Python venv (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -81,6 +96,21 @@ jobs:
           .\.venv\Scripts\python.exe python/bridge.py token-status '{}'
           .\.venv\Scripts\python.exe python/bridge.py save-token '{"token":"ci-smoke-token"}'
           .\.venv\Scripts\python.exe python/bridge.py token-status '{}'
+
+      - name: Build bundled bridge (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npm run bridge:build
+
+      - name: Smoke test bundled bridge (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\deepxiv-home-bundled" | Out-Null
+          $env:HOME = "$env:RUNNER_TEMP\deepxiv-home-bundled"
+          .\bridge-dist\deepxiv-bridge.exe token-status '{}'
+          .\bridge-dist\deepxiv-bridge.exe save-token '{"token":"ci-bundled-token"}'
+          .\bridge-dist\deepxiv-bridge.exe token-status '{}'
 
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}

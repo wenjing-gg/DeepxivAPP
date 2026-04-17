@@ -2,9 +2,10 @@
 node_modules/
 .venv/
 renderer/dist/
+bridge-dist/
+bridge-build/
 release/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-

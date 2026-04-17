@@ -1,6 +1,6 @@
 {
   "name": "deepxiv-client",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "DeepXiv cross-platform desktop client built with Electron and the official Python SDK",
   "author": "wenjing-gg",
   "repository": {
@@ -9,15 +9,16 @@
   },
   "main": "electron/main.js",
   "scripts": {
-    "start": "npm run renderer:build && electron .",
+    "start": "npm run bridge:build && npm run renderer:build && electron .",
     "dev": "concurrently -k \"npm:renderer:dev\" \"npm:electron:dev\"",
     "electron:dev": "wait-on tcp:5173 && ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .",
     "renderer:dev": "vite --config renderer/vite.config.js",
     "renderer:build": "vite build --config renderer/vite.config.js",
-    "build:mac": "npm run renderer:build && electron-builder --mac dir",
-    "dist:mac": "npm run renderer:build && electron-builder --mac dmg --publish never",
-    "build:win": "npm run renderer:build && electron-builder --win dir",
-    "dist:win": "npm run renderer:build && electron-builder --win nsis --publish never"
+    "bridge:build": "node scripts/build_bridge.js",
+    "build:mac": "npm run bridge:build && npm run renderer:build && electron-builder --mac dir",
+    "dist:mac": "npm run bridge:build && npm run renderer:build && electron-builder --mac dmg --publish never",
+    "build:win": "npm run bridge:build && npm run renderer:build && electron-builder --win dir",
+    "dist:win": "npm run bridge:build && npm run renderer:build && electron-builder --win nsis --publish never"
   },
   "build": {
     "appId": "cn.rag.deepxiv.client",
@@ -34,12 +35,8 @@
     ],
     "extraResources": [
       {
-        "from": "python",
-        "to": "python"
-      },
-      {
-        "from": ".venv",
-        "to": ".venv"
+        "from": "bridge-dist",
+        "to": "bridge"
       }
     ],
     "mac": {

@@ -34,6 +34,11 @@ npm install
 npm run dev
 ```
 
+说明：
+
+- 从源码运行时需要本机具备一个可用的 Python 3.10+ 来创建 `.venv`
+- 正式打包出来的桌面安装包会内置独立的 `bridge` 可执行文件，最终用户不需要额外安装 Python
+
 ## 本地打包
 
 ```bash

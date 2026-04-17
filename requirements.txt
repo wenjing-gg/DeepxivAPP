@@ -1,3 +1,4 @@
 deepxiv-sdk>=0.2.4
 python-dotenv>=1.0.1
 pypdf>=5.4.0
+pyinstaller>=6.0,<7
