@@ -247,7 +247,12 @@ function normalizeAiConfigStatus(raw, aiConfig = normalizeAiConfig()) {
 
 function toUserErrorMessage(error, fallback = '操作失败') {
   const raw = String(error?.message || fallback).trim();
-  return raw.replace(/^Error invoking remote method '[^']+': Error: /, '').replace(/^Error: /, '').trim() || fallback;
+  return raw
+    .replace(/^Error invoking remote method '[^']+': Error: /, '')
+    .replace(/^Command failed:[\s\S]*?(?:\r?\n|$)/, '')
+    .replace(/\[PYI-[^\n]+(?:\r?\n|$)/g, '')
+    .replace(/^Error: /, '')
+    .trim() || fallback;
 }
 
 function looksLikePdfUrl(url) {
@@ -583,6 +588,40 @@ function buildPdfPrefetchPayload(snapshot, rawPaper) {
     target: target.value,
     target_kind: target.kind,
   };
+}
+
+function buildSnapshotPayload(paper, options = {}) {
+  const normalizedPaper = normalizePaper(paper);
+  const basePayload = {
+    paper_key: normalizedPaper.paper_key,
+    favorite_key: normalizedPaper.favorite_key,
+    arxiv_id: normalizedPaper.arxiv_id,
+    openalex_id: normalizedPaper.openalex_id,
+    europepmc_id: normalizedPaper.europepmc_id,
+    europepmc_source: normalizedPaper.europepmc_source,
+    source_kind: normalizedPaper.source_kind,
+    source_label: normalizedPaper.source_label,
+    trackHistory: options.trackHistory !== false,
+  };
+
+  if (normalizedPaper.local_pdf_path || normalizedPaper.source_kind === 'local-pdf') {
+    return {
+      ...basePayload,
+      title: normalizedPaper.title,
+      publish_at: normalizedPaper.publish_at,
+      external_url: normalizedPaper.external_url,
+      pdf_url: normalizedPaper.pdf_url,
+      local_pdf_path: normalizedPaper.local_pdf_path,
+      author_line: normalizedPaper.author_line,
+      abstract: normalizedPaper.abstract,
+      full_context_text: normalizedPaper.full_context_text,
+      sections: normalizedPaper.sections,
+      contribution_points: normalizedPaper.contribution_points,
+      supports_favorite: normalizedPaper.supports_favorite,
+    };
+  }
+
+  return basePayload;
 }
 
 function buildAiPaperContext(snapshot, rawPaper) {
@@ -1298,28 +1337,7 @@ export default function App() {
     void prefetchPdfForPaper(previewSnapshot, paper);
     try {
       if (canLoadSnapshot) {
-        const snapshot = await window.deepxiv.snapshot({
-          paper_key: paper.paper_key,
-          favorite_key: paper.favorite_key,
-          arxiv_id: paper.arxiv_id,
-          openalex_id: paper.openalex_id,
-          europepmc_id: paper.europepmc_id,
-          europepmc_source: paper.europepmc_source,
-          source_kind: paper.source_kind,
-          source_label: paper.source_label,
-          title: paper.title,
-          publish_at: paper.publish_at,
-          external_url: paper.external_url,
-          pdf_url: paper.pdf_url,
-          local_pdf_path: paper.local_pdf_path,
-          author_line: paper.author_line,
-          abstract: paper.abstract,
-          full_context_text: paper.full_context_text,
-          sections: paper.sections,
-          contribution_points: paper.contribution_points,
-          supports_favorite: paper.supports_favorite,
-          trackHistory: options.trackHistory !== false
-        });
+        const snapshot = await window.deepxiv.snapshot(buildSnapshotPayload(paper, options));
         setSnapshots((prev) => ({ ...prev, [context]: snapshot }));
         void prefetchPdfForPaper(snapshot, paper);
         if (options.trackHistory !== false) {

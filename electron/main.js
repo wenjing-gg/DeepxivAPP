@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 
@@ -1114,6 +1114,31 @@ async function findPython() {
   throw new Error('未找到可用的 Python 解释器');
 }
 
+function parseBridgeResponse(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) {
+    return null;
+  }
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      return JSON.parse(lines[index]);
+    } catch (error) {
+    }
+  }
+  return null;
+}
+
+function normalizeBridgeErrorMessage(rawMessage, fallback = '服务调用失败') {
+  const raw = String(rawMessage || '').trim();
+  const cleaned = raw
+    .replace(/^Command failed:[\s\S]*?(?:\r?\n|$)/, '')
+    .replace(/\[PYI-[^\n]+(?:\r?\n|$)/g, '')
+    .replace(/^Error: /, '')
+    .trim();
+  return cleaned || fallback;
+}
+
 async function callBridge(command, payload = {}) {
   const bundledBridge = await findBundledBridge();
   const useBundledBridge = app.isPackaged || Boolean(bundledBridge);
@@ -1123,42 +1148,85 @@ async function callBridge(command, payload = {}) {
 
   const executable = useBundledBridge ? bundledBridge : await findPython();
   const args = useBundledBridge
-    ? [command, JSON.stringify(payload)]
-    : [bridgePath(), command, JSON.stringify(payload)];
+    ? [command, '--stdin']
+    : [bridgePath(), command, '--stdin'];
 
   return new Promise((resolve, reject) => {
-    execFile(executable, args, { cwd: appRoot(), env: bridgeEnv(), timeout: 120000 }, (error, stdout, stderr) => {
-      const trimmed = String(stdout || '').trim();
-      const lines = trimmed ? trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
-      const candidate = lines.length ? lines[lines.length - 1] : trimmed;
-      let parsed = null;
-      if (candidate) {
-        try {
-          parsed = JSON.parse(candidate);
-        } catch (parseError) {
-          parsed = null;
-        }
-      }
-      if (error) {
-        const rawError = parsed?.error || stderr.trim() || trimmed || error.message;
-        if (!useBundledBridge && /ENOENT|not found|spawn .*python/i.test(String(error.message || rawError))) {
-          reject(new Error('未找到可用的 Python 运行环境；请安装 Python 3.10+，或使用正式安装包版本'));
-          return;
-        }
-        reject(new Error(rawError));
+    const child = spawn(executable, args, {
+      cwd: appRoot(),
+      env: bridgeEnv(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, 120000);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (error) => {
+      if (settled) {
         return;
       }
-      try {
-        const response = parsed || JSON.parse(candidate || '{}');
-        if (!response.ok) {
-          reject(new Error(response.error || '请求失败'));
+      settled = true;
+      clearTimeout(timer);
+      if (!useBundledBridge && /ENOENT|not found|spawn .*python/i.test(String(error.message || ''))) {
+        reject(new Error('未找到可用的 Python 运行环境；请安装 Python 3.10+，或使用正式安装包版本'));
+        return;
+      }
+      reject(new Error(normalizeBridgeErrorMessage(error.message, '服务调用失败')));
+    });
+
+    child.on('close', (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+
+      const response = parseBridgeResponse(stdout) || parseBridgeResponse(stderr);
+      if (code !== 0) {
+        if (timedOut) {
+          reject(new Error('服务请求超时'));
           return;
         }
-        resolve(response.data);
-      } catch (parseError) {
-        reject(new Error('服务返回格式异常'));
+        const rawError = response?.error || stderr || stdout || '';
+        reject(new Error(normalizeBridgeErrorMessage(rawError, '服务调用失败')));
+        return;
       }
+
+      if (!response) {
+        reject(new Error('服务返回格式异常'));
+        return;
+      }
+      if (!response.ok) {
+        reject(new Error(response.error || '请求失败'));
+        return;
+      }
+      resolve(response.data);
     });
+
+    try {
+      child.stdin.end(JSON.stringify(payload));
+    } catch (error) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('服务请求写入失败'));
+      }
+    }
+    child.stdin.on('error', () => {});
   });
 }
 

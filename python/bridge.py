@@ -1605,7 +1605,15 @@ def main() -> int:
         emit_error("缺少命令")
         return 1
 
-    raw_payload = sys.argv[2] if len(sys.argv) > 2 else "{}"
+    raw_payload = "{}"
+    if len(sys.argv) > 2:
+        raw_payload = sys.argv[2]
+        if raw_payload == "--stdin":
+            raw_payload = sys.stdin.read()
+    elif not sys.stdin.isatty():
+        raw_payload = sys.stdin.read()
+
+    raw_payload = (raw_payload or "").strip() or "{}"
     try:
         payload = json.loads(raw_payload)
     except json.JSONDecodeError:
