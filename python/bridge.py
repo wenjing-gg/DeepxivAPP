@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+import io
 import re
 import socket
 import ssl
 import struct
 import sys
+import tarfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 import requests
 from dotenv import load_dotenv
@@ -23,6 +26,7 @@ from deepxiv_sdk.cli import DEFAULT_DAILY_LIMIT, SDK_REGISTER_ENDPOINT, ensure_t
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 EUROPEPMC_ARTICLE_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/article/{source}/{id}"
+PMC_OA_SERVICE_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
 HTTP_TIMEOUT = 30
 
 SOURCE_PRIORITY = {
@@ -358,6 +362,11 @@ def looks_like_probable_pdf_url(url: Any) -> bool:
     parsed = urlsplit(value)
     query = f"{parsed.query}&{parsed.fragment}".lower()
     return any(token in query for token in ("download=1", "download=true", "format=pdf", "type=pdf"))
+
+
+def is_known_restricted_pdf_host(url: Any) -> bool:
+    host = urlsplit(str(url or "").strip()).netloc.lower()
+    return host in {"dl.acm.org", "www.gbv.de"}
 
 
 def local_pdf_key(file_path: Path) -> str:
@@ -1008,7 +1017,7 @@ def pick_openalex_pdf_url(item: Dict[str, Any]) -> str:
     ]
     for candidate in candidates:
         url = normalize_spaces(candidate)
-        if looks_like_probable_pdf_url(url):
+        if looks_like_probable_pdf_url(url) and not is_known_restricted_pdf_host(url):
             return url
     return ""
 
@@ -1028,6 +1037,74 @@ def pick_openalex_external_url(item: Dict[str, Any], pdf_url: str) -> str:
         if url:
             return url
     return ""
+
+
+def fetch_pmc_oa_package_url(pmcid: str) -> str:
+    response = requests.get(
+        PMC_OA_SERVICE_URL,
+        params={"id": pmcid},
+        timeout=HTTP_TIMEOUT,
+        headers={"User-Agent": "DeepXiv Client"},
+    )
+    response.raise_for_status()
+    root = ElementTree.fromstring(response.text)
+    for link in root.findall('.//record/link'):
+        href = normalize_spaces(link.attrib.get("href"))
+        fmt = normalize_spaces(link.attrib.get("format")).lower()
+        if href and fmt in {"tgz", "pdf"}:
+            return href
+    raise ValueError("PMC 当前未提供可下载的开放获取 PDF")
+
+
+def normalize_pmc_oa_download_url(url: str) -> str:
+    value = normalize_spaces(url)
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() == "ftp" and parsed.netloc.lower() == "ftp.ncbi.nlm.nih.gov":
+        path = parsed.path.lstrip("/")
+        if path.startswith("pub/pmc/") and not path.startswith("pub/pmc/deprecated/"):
+            path = path.replace("pub/pmc/", "pub/pmc/deprecated/", 1)
+        return f"https://ftp.ncbi.nlm.nih.gov/{path}"
+    return value
+
+
+def extract_pdf_from_tar_gz_bytes(data: bytes) -> bytes:
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        members = [member for member in archive.getmembers() if member.isfile() and member.name.lower().endswith('.pdf')]
+        if not members:
+            raise ValueError("PMC OA 包中未找到 PDF 文件")
+        members.sort(key=lambda member: (member.name.count('/'), len(member.name)))
+        extracted = archive.extractfile(members[0])
+        if not extracted:
+            raise ValueError("PMC PDF 提取失败")
+        content = extracted.read()
+        if not content.startswith(b'%PDF'):
+            raise ValueError("PMC 返回内容不是有效 PDF")
+        return content
+
+
+def cmd_cache_pmc_pdf(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pmcid = normalize_spaces(payload.get("pmcid")).upper()
+    cache_path = normalize_spaces(payload.get("cache_path"))
+    if not pmcid.startswith("PMC"):
+        raise ValueError("缺少有效的 PMCID")
+    if not cache_path:
+        raise ValueError("缺少缓存路径")
+
+    package_url = fetch_pmc_oa_package_url(pmcid)
+    download_url = normalize_pmc_oa_download_url(package_url)
+    response = requests.get(download_url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "DeepXiv Client"})
+    response.raise_for_status()
+    package_bytes = response.content
+
+    pdf_bytes = extract_pdf_from_tar_gz_bytes(package_bytes) if download_url.lower().endswith('.tar.gz') else package_bytes
+    output_path = Path(cache_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(pdf_bytes)
+    return {
+        "cached_path": str(output_path),
+        "source_url": download_url,
+        "size": len(pdf_bytes),
+    }
 
 
 def europepmc_source_meta(source_code: str) -> Dict[str, str]:
@@ -1472,6 +1549,7 @@ COMMANDS = {
     "snapshot": cmd_snapshot,
     "import-local-pdf": lambda payload: parse_local_pdf(str(payload.get("path") or "")),
     "section": cmd_section,
+    "cache-pmc-pdf": cmd_cache_pmc_pdf,
 }
 
 

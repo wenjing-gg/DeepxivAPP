@@ -1479,6 +1479,9 @@ textarea {
   flex: 1;
   min-height: 0;
   margin: 18px;
+  min-height: 520px;
+  height: min(68vh, 760px);
+  resize: vertical;
 }
 
 .ai-chat-header {
@@ -1818,6 +1821,12 @@ textarea {
 
   .onboarding-copy h2 {
     font-size: 24px;
+  }
+
+  .ai-chat-panel.inline {
+    min-height: 420px;
+    height: auto;
+    resize: none;
   }
 
   .toolbar {

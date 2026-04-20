@@ -300,6 +300,7 @@ function normalizePdfPayload(payload = {}) {
     sourceUrl,
     localPath,
     cachePath,
+    pmcid: String(payload.pmcid || '').trim().toUpperCase(),
   };
 }
 
@@ -389,6 +390,42 @@ function validatePdfSignature(firstChunk, response, normalized) {
   return false;
 }
 
+function isPmcOaCandidate(normalized) {
+  const sourceKind = String(normalized?.sourceKind || normalized?.source_kind || '').trim().toLowerCase();
+  return Boolean(normalized?.pmcid && ['pubmed', 'pmc', 'preprint', 'europepmc'].includes(sourceKind));
+}
+
+function toPdfPrefetchUserMessage(error) {
+  const message = String(error?.message || error || '').trim();
+  if (/403/.test(message)) {
+    return '源站限制 PDF 直连';
+  }
+  if (/404/.test(message)) {
+    return '源站未提供可用 PDF';
+  }
+  if (/timed out|timeout/i.test(message)) {
+    return 'PDF 缓存超时';
+  }
+  if (/open access|开放获取|PMCID|PMC/.test(message)) {
+    return 'PMC 当前未提供可缓存 PDF';
+  }
+  return 'PDF 缓存失败';
+}
+
+async function cachePmcPdfViaBridge(normalized, tempPath) {
+  if (!normalized?.pmcid || !tempPath) {
+    throw new Error('缺少 PMCID 缓存参数');
+  }
+  const result = await callBridge('cache-pmc-pdf', {
+    pmcid: normalized.pmcid,
+    cache_path: tempPath,
+  });
+  return {
+    cachedPath: String(result?.cached_path || tempPath).trim() || tempPath,
+    sourceUrl: String(result?.source_url || normalized.sourceUrl || '').trim(),
+  };
+}
+
 async function startPdfPrefetch(normalized) {
   const existing = pdfPrefetchTasks.get(normalized.paperKey);
   if (existing) {
@@ -413,6 +450,23 @@ async function startPdfPrefetch(normalized) {
     let fileHandle = null;
     try {
       await fsp.mkdir(path.dirname(normalized.cachePath), { recursive: true });
+
+      if (isPmcOaCandidate(normalized)) {
+        const pmcResult = await cachePmcPdfViaBridge(normalized, tempPath);
+        await fsp.rename(pmcResult.cachedPath, normalized.cachePath);
+        emitPdfPrefetchStatus({
+          ...initialStatus,
+          state: 'ready',
+          progress: 1,
+          sourceUrl: pmcResult.sourceUrl || normalized.sourceUrl,
+          cachedPath: normalized.cachePath,
+          openTarget: normalized.cachePath,
+          message: 'PDF 已缓存，下次打开更快',
+          isCached: true,
+        });
+        return;
+      }
+
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 180000);
       const response = await fetch(normalized.sourceUrl, {
@@ -493,7 +547,7 @@ async function startPdfPrefetch(normalized) {
         state: 'error',
         progress: 0,
         openTarget: normalized.sourceUrl || normalized.target,
-        message: String(error?.name || '') === 'AbortError' ? 'PDF 缓存超时' : 'PDF 缓存失败',
+        message: String(error?.name || '') === 'AbortError' ? 'PDF 缓存超时' : toPdfPrefetchUserMessage(error),
         error: String(error?.message || error || 'PDF 缓存失败').trim(),
         isCached: false,
       });

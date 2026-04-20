@@ -575,6 +575,7 @@ function buildPdfPrefetchPayload(snapshot, rawPaper) {
     openalex_id: snapshot?.openalex_id || paper.openalex_id,
     europepmc_id: snapshot?.europepmc_id || paper.europepmc_id,
     europepmc_source: snapshot?.europepmc_source || paper.europepmc_source,
+    pmcid: snapshot?.head?.pmcid || snapshot?.brief?.pmcid || paper.pmcid || '',
     title: snapshot?.brief?.title || snapshot?.head?.title || paper.title || '论文 PDF',
     external_url: snapshot?.head?.src_url || snapshot?.brief?.src_url || paper.external_url || '',
     pdf_url: resolvePdfUrl(snapshot, paper),
