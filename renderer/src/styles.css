@@ -102,35 +102,40 @@ textarea {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(360px, 520px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 760px);
+  justify-content: center;
+  align-content: center;
   gap: 18px;
   min-height: calc(100vh - 36px);
 }
 
-.onboarding-hero,
 .onboarding-panel {
   position: relative;
   z-index: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-radius: 30px;
-  padding: 18px;
-}
-
-.onboarding-hero {
-  gap: 18px;
+  border-radius: 24px;
+  padding: 22px;
 }
 
 .onboarding-brand {
-  padding: 0 6px;
+  padding: 0;
 }
 
 .onboarding-copy {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 6px;
+  gap: 8px;
+  padding: 0;
+}
+
+.onboarding-copy.minimal {
+  padding: 2px 2px 0;
+}
+
+.onboarding-copy.compact {
+  gap: 0;
 }
 
 .onboarding-copy h2,
@@ -140,9 +145,9 @@ textarea {
 }
 
 .onboarding-copy h2 {
-  font-size: 40px;
-  line-height: 1.08;
-  letter-spacing: -0.05em;
+  font-size: 28px;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
 }
 
 .onboarding-copy p,
@@ -150,81 +155,64 @@ textarea {
 .onboarding-footnote {
   margin: 0;
   color: var(--muted);
-  line-height: 1.7;
-}
-
-.onboarding-summary {
-  padding: 18px;
-  border-radius: 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0.56));
-}
-
-.onboarding-step-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.onboarding-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.onboarding-list-item {
-  display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
-  gap: 2px 12px;
-  align-items: start;
-}
-
-.onboarding-list-item span {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  border-radius: 16px;
-  background: rgba(37, 99, 235, 0.08);
-  color: var(--primary-strong);
-  font-size: 12px;
-  font-weight: 900;
-  grid-row: 1 / span 2;
-}
-
-.onboarding-list-item strong,
-.onboarding-list-item em {
-  font-style: normal;
-}
-
-.onboarding-list-item strong {
-  color: var(--text-strong);
-  font-size: 15px;
-  font-weight: 800;
-}
-
-.onboarding-list-item em {
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.6;
 }
 
 .onboarding-panel {
-  gap: 16px;
+  gap: 14px;
+}
+
+.onboarding-panel-minimal {
+  max-width: 760px;
+  margin: 0 auto;
 }
 
 .onboarding-panel-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 14px;
 }
 
 .onboarding-section-card {
-  gap: 14px;
+  gap: 12px;
+}
+
+.onboarding-section-card.compact {
+  padding-top: 14px;
+  padding-bottom: 14px;
+}
+
+.onboarding-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.onboarding-status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.onboarding-status-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.onboarding-status-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.onboarding-status-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-strong);
 }
 
 .onboarding-section-head {
@@ -234,6 +222,11 @@ textarea {
   gap: 12px;
 }
 
+.onboarding-inline-actions {
+  justify-content: flex-start;
+  margin-top: 2px;
+}
+
 .onboarding-form-grid {
   margin-top: 2px;
 }
@@ -241,10 +234,10 @@ textarea {
 .onboarding-footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 16px;
-  margin-top: auto;
-  padding: 4px 4px 0;
+  margin-top: 4px;
+  padding: 0;
 }
 
 .onboarding-footnote {
@@ -1717,10 +1710,6 @@ textarea {
     grid-template-columns: 248px minmax(0, 1fr);
   }
 
-  .onboarding-layout {
-    grid-template-columns: minmax(320px, 460px) minmax(0, 1fr);
-  }
-
   .topbar {
     padding: 22px 24px;
   }
@@ -1784,6 +1773,7 @@ textarea {
 
   .onboarding-layout {
     min-height: auto;
+    align-content: start;
   }
 }
 
@@ -1802,7 +1792,6 @@ textarea {
   .settings-card,
   .list-panel,
   .detail-panel,
-  .onboarding-hero,
   .onboarding-panel,
   .toolbar {
     border-radius: 24px;
@@ -1820,10 +1809,15 @@ textarea {
   .onboarding-panel-header,
   .onboarding-section-head {
     flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .onboarding-status-item {
+    align-items: flex-start;
   }
 
   .onboarding-copy h2 {
-    font-size: 30px;
+    font-size: 24px;
   }
 
   .toolbar {

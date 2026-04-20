@@ -429,7 +429,7 @@ function formatPdfPrefetchMessage(status) {
     return status.message || (status.progress > 0 ? `正在缓存 PDF… ${Math.round(status.progress * 100)}%` : '正在缓存 PDF…');
   }
   if (status.state === 'error') {
-    return status.message || 'PDF 缓存失败，已回退直连打开';
+    return status.message || 'PDF 缓存失败';
   }
   return status.message || '';
 }
@@ -874,8 +874,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
   const authorLine = head.author_line || brief.author_line || paper?.author_line || '';
   const paperId = effectiveSnapshot.arxiv_id || effectiveSnapshot.openalex_id || effectiveSnapshot.europepmc_id || paper?.arxiv_id || paper?.openalex_id || paper?.europepmc_id || '';
   const meta = [authorLine, paperId, brief.publish_at || head.publish_at || paper?.publish_at || '', `引用 ${brief.citations || head.citations || 0}`].filter(Boolean).join(' · ');
-  const openTarget = resolveOpenTarget(effectiveSnapshot, paper);
-  const openLabel = openTarget?.kind === 'path' || looksLikePdfUrl(openTarget?.value) || sourceKind === 'local-pdf' || sourceKind === 'arxiv' ? '打开 PDF' : '打开来源';
+  const canOpenPdf = Boolean(buildPdfPrefetchPayload(effectiveSnapshot, paper));
   const pdfStatusText = formatPdfPrefetchMessage(pdfStatus);
 
   if (embeddedPdf?.target) {
@@ -903,7 +902,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
           <div className="detail-meta">{meta}</div>
           <div className="detail-actions">
             <button className="btn" disabled={!canFavorite} onClick={onToggleFavorite}>{canFavorite ? (isFavorite ? '取消收藏' : '加入收藏') : '暂不支持收藏'}</button>
-            <button className="btn" disabled={!openTarget} onClick={onOpenPdf}>{openLabel}</button>
+            <button className="btn" disabled={!canOpenPdf} onClick={onOpenPdf}>打开 PDF</button>
           </div>
           {pdfStatusText && <div className={`pdf-prefetch-hint ${pdfStatus?.state || 'idle'}`}>{pdfStatusText}</div>}
         </div>
@@ -965,85 +964,55 @@ function OnboardingView({
     <div className="onboarding-shell">
       <AppBackground />
       <div className="onboarding-layout">
-        <section className="card onboarding-hero">
-          <div className="window-controls" aria-hidden="true">
-            <span className="window-dot red" />
-            <span className="window-dot yellow" />
-            <span className="window-dot green" />
-          </div>
-          <div className="brand onboarding-brand">
-            <div className="brand-mark">DX</div>
-            <div className="brand-copy">
-              <h1>DeepXiv</h1>
-              <p>Desktop Client</p>
-            </div>
-          </div>
-          <div className="onboarding-copy">
-            <div className="sidebar-label">Welcome</div>
-            <h2>先完成自动连接，再开始阅读与对话</h2>
-            <p>打开软件后会先自动为你准备匿名账号连接，然后你可以按需配置 AI 助手，最后无缝进入正式页面继续使用。</p>
-          </div>
-          <div className="onboarding-summary card">
-            <div className="onboarding-step-row">
-              <div className={`token-indicator ${connectionIndicatorClass}`} title={tokenStatusHint}>{connectionIndicator}</div>
-              <div className="settings-status-copy">
-                <div className="settings-status-label">{connectionTitle}</div>
-                <div className="settings-status-hint">{onboardingMessage || tokenStatusHint}</div>
+        <section className="card onboarding-panel onboarding-panel-minimal">
+          <div className="onboarding-panel-header">
+            <div className="brand onboarding-brand">
+              <div className="brand-mark">DX</div>
+              <div className="brand-copy">
+                <h1>DeepXiv</h1>
+                <p>自动连接后即可开始</p>
               </div>
             </div>
-            <div className="status-card-divider" />
-            <div className="onboarding-list">
-              <div className="onboarding-list-item"><span>01</span><strong>自动匿名注册</strong><em>无需手动点击，启动时自动完成</em></div>
-              <div className="onboarding-list-item"><span>02</span><strong>可选配置 AI</strong><em>现在配置，进入后即可直接对话</em></div>
-              <div className="onboarding-list-item"><span>03</span><strong>进入正式界面</strong><em>搜索、收藏、阅读和 AI 助手全部就绪</em></div>
-            </div>
-          </div>
-        </section>
-
-        <section className="card onboarding-panel">
-          <div className="onboarding-panel-header">
-            <div>
-              <div className="sidebar-label">Quick Start</div>
-              <h3>首次进入前的准备</h3>
-            </div>
             <div className={`status-pill ${(isInitializing || isAutoRegistering || isSavingAiConfig) ? 'active' : ''}`}>
-              {isInitializing ? '正在初始化…' : isAutoRegistering ? '正在注册…' : isSavingAiConfig ? '正在验证 AI…' : '准备完成'}
+              {isInitializing ? '初始化中' : isAutoRegistering ? '连接中' : isSavingAiConfig ? '验证中' : '已就绪'}
             </div>
           </div>
 
-          <div className="settings-card onboarding-section-card">
-            <div className="sidebar-label">Step 1</div>
-            <h3>自动匿名注册</h3>
-            <div className="settings-status-row">
-              <div className={`token-indicator ${connectionIndicatorClass}`} title={tokenStatusHint}>{connectionIndicator}</div>
-              <div className="settings-status-copy">
-                <div className="settings-status-label">{tokenStatusLabel}</div>
-                <div className="settings-status-hint">{token?.has_token ? '已自动完成匿名注册，可直接搜索与阅读。' : (onboardingMessage || tokenStatusHint)}</div>
+          <div className="onboarding-copy minimal compact">
+            <p>{token?.has_token ? '匿名连接已准备好。' : (onboardingMessage || '正在自动连接…')}</p>
+          </div>
+
+          <div className="settings-card onboarding-section-card compact">
+            <div className="onboarding-status-list">
+              <div className="onboarding-status-item">
+                <div className="onboarding-status-meta">
+                  <span className="onboarding-status-name">连接</span>
+                  <span className="settings-status-hint">{token?.has_token ? tokenStatusLabel : connectionTitle}</span>
+                </div>
+                <div className={`token-indicator ${connectionIndicatorClass}`} title={tokenStatusHint}>{connectionIndicator}</div>
+              </div>
+              <div className="onboarding-status-item">
+                <div className="onboarding-status-meta">
+                  <span className="onboarding-status-name">AI</span>
+                  <span className="settings-status-hint">{aiStatusLabel}</span>
+                </div>
+                <div className={`token-indicator ${aiIndicatorClass}`} title={aiStatusHint}>{aiIndicator}</div>
               </div>
             </div>
             {!token?.has_token && !isInitializing && !isAutoRegistering && (
-              <div className="btn-row">
-                <button className="btn primary" onClick={onRetryConnection}>重试自动注册</button>
+              <div className="btn-row onboarding-inline-actions">
+                <button className="btn" onClick={onRetryConnection}>重新连接</button>
               </div>
             )}
           </div>
 
-          <div className="settings-card onboarding-section-card">
+          <div className="settings-card onboarding-section-card compact">
             <div className="onboarding-section-head">
               <div>
-                <div className="sidebar-label">Step 2</div>
-                <h3>可选配置 AI 助手</h3>
+                <div className="onboarding-section-title">可选 AI 配置</div>
               </div>
-              <button className="mini-btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '收起' : '现在配置'}</button>
+              <button className="mini-btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '收起' : '配置'}</button>
             </div>
-            <div className="settings-status-row">
-              <div className={`token-indicator ${aiIndicatorClass}`} title={aiStatusHint}>{aiIndicator}</div>
-              <div className="settings-status-copy">
-                <div className="settings-status-label">{aiStatusLabel}</div>
-                <div className="settings-status-hint">{aiStatusHint}</div>
-              </div>
-            </div>
-            <div className="onboarding-note">AI 配置不是必填项。你可以现在配置，也可以先进入软件，稍后到设置页继续调整。</div>
             {shouldShowAiForm && (
               <>
                 <div className="form-grid onboarding-form-grid">
@@ -1076,9 +1045,8 @@ function OnboardingView({
           </div>
 
           <div className="onboarding-footer">
-            <div className="onboarding-footnote">进入正式页面后，侧边栏和设置页都会沿用相同的连接状态与 AI 配置。</div>
             <div className="btn-row">
-              <button className="btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '稍后再配置 AI' : '展开 AI 配置'}</button>
+              <button className="btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '稍后配置' : '配置 AI'}</button>
               <button className="btn primary" disabled={!canContinue} onClick={onContinue}>进入 DeepXiv</button>
             </div>
           </div>
@@ -1602,25 +1570,28 @@ export default function App() {
   }
 
   async function openPaperAsset(context, snapshot, paper) {
-    const target = resolveOpenTarget(snapshot, paper);
-    if (!target?.value) return;
-    if (target.kind === 'path' || looksLikePdfUrl(target.value)) {
-      const payload = buildPdfPrefetchPayload(snapshot, paper);
-      const resolved = await resolvePdfOpenForPaper(snapshot, paper).catch(() => null);
+    const payload = buildPdfPrefetchPayload(snapshot, paper);
+    if (!payload) {
+      setStatusText('当前论文暂未提供可打开的 PDF');
+      return;
+    }
+    try {
+      const resolved = await resolvePdfOpenForPaper(snapshot, paper);
       updateEmbeddedPdfViewer(context, {
-        target: resolved?.openTarget || target.value,
+        target: resolved?.openTarget || payload.target,
         title: snapshot?.brief?.title || snapshot?.head?.title || paper?.title || '论文 PDF',
         paperKey: getPaperSessionKey(snapshot, paper),
-        payload: payload ? {
+        payload: {
           ...payload,
           target: resolved?.openTarget || payload.target,
           local_pdf_path: resolved?.cachedPath || payload.local_pdf_path,
           pdf_url: resolved?.sourceUrl || payload.pdf_url,
-        } : null,
+        },
       });
-      return;
+      setStatusText('');
+    } catch (error) {
+      setStatusText(toUserErrorMessage(error, '打开 PDF 失败'));
     }
-    await window.deepxiv.openExternal(target.value);
   }
 
   const loadEmbeddedPdfDocument = useCallback(async (payload) => {
@@ -1684,12 +1655,6 @@ export default function App() {
     <div className="app-shell">
       <AppBackground />
       <aside className="sidebar">
-        <div className="window-controls" aria-hidden="true">
-          <span className="window-dot red" />
-          <span className="window-dot yellow" />
-          <span className="window-dot green" />
-        </div>
-
         <div className="brand">
           <div className="brand-mark">DX</div>
           <div className="brand-copy">

@@ -490,7 +490,7 @@ async function startPdfPrefetch(normalized) {
         state: 'error',
         progress: 0,
         openTarget: normalized.sourceUrl || normalized.target,
-        message: String(error?.name || '') === 'AbortError' ? 'PDF 缓存超时，已回退直连打开' : 'PDF 缓存失败，已回退直连打开',
+        message: String(error?.name || '') === 'AbortError' ? 'PDF 缓存超时' : 'PDF 缓存失败',
         error: String(error?.message || error || 'PDF 缓存失败').trim(),
         isCached: false,
       });
