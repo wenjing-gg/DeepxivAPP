@@ -915,9 +915,188 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
   );
 }
 
+function AppBackground() {
+  return (
+    <div className="app-bg" aria-hidden="true">
+      <div className="app-bg-grid" />
+      <div className="app-bg-noise" />
+      <div className="app-bg-glow glow-blue" />
+      <div className="app-bg-glow glow-purple" />
+      <div className="app-bg-glow glow-teal" />
+    </div>
+  );
+}
+
+function OnboardingView({
+  token,
+  tokenStatusLabel,
+  tokenStatusHint,
+  tokenIndicator,
+  tokenIndicatorClass: baseTokenIndicatorClass,
+  aiConfigForm,
+  aiConfigStatus,
+  aiStatusLabel,
+  aiStatusHint,
+  aiIndicator,
+  aiIndicatorClass,
+  isInitializing,
+  isAutoRegistering,
+  isSavingAiConfig,
+  onboardingMessage,
+  showOnboardingAiForm,
+  onToggleAiForm,
+  onRetryConnection,
+  onContinue,
+  onResetAiConfig,
+  onSaveAiConfig,
+  updateAiFormField,
+}) {
+  const canContinue = Boolean(token?.has_token) && !isInitializing && !isAutoRegistering && !isSavingAiConfig;
+  const connectionIndicator = token?.has_token ? '✓' : ((isInitializing || isAutoRegistering) ? '…' : tokenIndicator);
+  const connectionIndicatorClass = token?.has_token ? 'success' : ((isInitializing || isAutoRegistering) ? 'loading' : baseTokenIndicatorClass);
+  const connectionTitle = token?.has_token
+    ? '已自动完成匿名注册'
+    : (isInitializing || isAutoRegistering)
+      ? '正在自动匿名注册'
+      : '自动注册暂未完成';
+  const shouldShowAiForm = showOnboardingAiForm || !aiConfigStatus?.ok;
+
+  return (
+    <div className="onboarding-shell">
+      <AppBackground />
+      <div className="onboarding-layout">
+        <section className="card onboarding-hero">
+          <div className="window-controls" aria-hidden="true">
+            <span className="window-dot red" />
+            <span className="window-dot yellow" />
+            <span className="window-dot green" />
+          </div>
+          <div className="brand onboarding-brand">
+            <div className="brand-mark">DX</div>
+            <div className="brand-copy">
+              <h1>DeepXiv</h1>
+              <p>Desktop Client</p>
+            </div>
+          </div>
+          <div className="onboarding-copy">
+            <div className="sidebar-label">Welcome</div>
+            <h2>先完成自动连接，再开始阅读与对话</h2>
+            <p>打开软件后会先自动为你准备匿名账号连接，然后你可以按需配置 AI 助手，最后无缝进入正式页面继续使用。</p>
+          </div>
+          <div className="onboarding-summary card">
+            <div className="onboarding-step-row">
+              <div className={`token-indicator ${connectionIndicatorClass}`} title={tokenStatusHint}>{connectionIndicator}</div>
+              <div className="settings-status-copy">
+                <div className="settings-status-label">{connectionTitle}</div>
+                <div className="settings-status-hint">{onboardingMessage || tokenStatusHint}</div>
+              </div>
+            </div>
+            <div className="status-card-divider" />
+            <div className="onboarding-list">
+              <div className="onboarding-list-item"><span>01</span><strong>自动匿名注册</strong><em>无需手动点击，启动时自动完成</em></div>
+              <div className="onboarding-list-item"><span>02</span><strong>可选配置 AI</strong><em>现在配置，进入后即可直接对话</em></div>
+              <div className="onboarding-list-item"><span>03</span><strong>进入正式界面</strong><em>搜索、收藏、阅读和 AI 助手全部就绪</em></div>
+            </div>
+          </div>
+        </section>
+
+        <section className="card onboarding-panel">
+          <div className="onboarding-panel-header">
+            <div>
+              <div className="sidebar-label">Quick Start</div>
+              <h3>首次进入前的准备</h3>
+            </div>
+            <div className={`status-pill ${(isInitializing || isAutoRegistering || isSavingAiConfig) ? 'active' : ''}`}>
+              {isInitializing ? '正在初始化…' : isAutoRegistering ? '正在注册…' : isSavingAiConfig ? '正在验证 AI…' : '准备完成'}
+            </div>
+          </div>
+
+          <div className="settings-card onboarding-section-card">
+            <div className="sidebar-label">Step 1</div>
+            <h3>自动匿名注册</h3>
+            <div className="settings-status-row">
+              <div className={`token-indicator ${connectionIndicatorClass}`} title={tokenStatusHint}>{connectionIndicator}</div>
+              <div className="settings-status-copy">
+                <div className="settings-status-label">{tokenStatusLabel}</div>
+                <div className="settings-status-hint">{token?.has_token ? '已自动完成匿名注册，可直接搜索与阅读。' : (onboardingMessage || tokenStatusHint)}</div>
+              </div>
+            </div>
+            {!token?.has_token && !isInitializing && !isAutoRegistering && (
+              <div className="btn-row">
+                <button className="btn primary" onClick={onRetryConnection}>重试自动注册</button>
+              </div>
+            )}
+          </div>
+
+          <div className="settings-card onboarding-section-card">
+            <div className="onboarding-section-head">
+              <div>
+                <div className="sidebar-label">Step 2</div>
+                <h3>可选配置 AI 助手</h3>
+              </div>
+              <button className="mini-btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '收起' : '现在配置'}</button>
+            </div>
+            <div className="settings-status-row">
+              <div className={`token-indicator ${aiIndicatorClass}`} title={aiStatusHint}>{aiIndicator}</div>
+              <div className="settings-status-copy">
+                <div className="settings-status-label">{aiStatusLabel}</div>
+                <div className="settings-status-hint">{aiStatusHint}</div>
+              </div>
+            </div>
+            <div className="onboarding-note">AI 配置不是必填项。你可以现在配置，也可以先进入软件，稍后到设置页继续调整。</div>
+            {shouldShowAiForm && (
+              <>
+                <div className="form-grid onboarding-form-grid">
+                  <label className="form-field">
+                    <span>model</span>
+                    <input className="input" value={aiConfigForm.model} onChange={(event) => updateAiFormField('model', event.target.value)} list="model-options-onboarding" />
+                    <datalist id="model-options-onboarding">
+                      <option value="gpt-5.4" />
+                      <option value="gpt-5.4-fast" />
+                      <option value="gpt-5-codex" />
+                    </datalist>
+                  </label>
+                  <label className="form-field">
+                    <span>reasoning_effort</span>
+                    <select className="select" value={aiConfigForm.modelReasoningEffort} onChange={(event) => updateAiFormField('modelReasoningEffort', event.target.value)}>
+                      {AI_REASONING_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                    </select>
+                  </label>
+                  <label className="form-field form-field-wide">
+                    <span>OPENAI_API_KEY</span>
+                    <input className="input" type="password" placeholder="sk-..." value={aiConfigForm.openAIApiKey} onChange={(event) => updateAiFormField('openAIApiKey', event.target.value)} />
+                  </label>
+                </div>
+                <div className="btn-row">
+                  <button className="btn primary" onClick={onSaveAiConfig} disabled={isSavingAiConfig}>保存并测试 AI</button>
+                  <button className="btn" onClick={onResetAiConfig}>恢复默认</button>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="onboarding-footer">
+            <div className="onboarding-footnote">进入正式页面后，侧边栏和设置页都会沿用相同的连接状态与 AI 配置。</div>
+            <div className="btn-row">
+              <button className="btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '稍后再配置 AI' : '展开 AI 配置'}</button>
+              <button className="btn primary" disabled={!canContinue} onClick={onContinue}>进入 DeepXiv</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState('search');
   const [statusText, setStatusText] = useState('');
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [showOnboarding, setShowOnboarding] = useState(true);
+  const [isAutoRegistering, setIsAutoRegistering] = useState(false);
+  const [onboardingMessage, setOnboardingMessage] = useState('正在准备 DeepXiv…');
+  const [showOnboardingAiForm, setShowOnboardingAiForm] = useState(false);
+  const [isSavingAiConfig, setIsSavingAiConfig] = useState(false);
   const [token, setToken] = useState(null);
   const [favorites, setFavorites] = useState([]);
   const [favoriteGroups, setFavoriteGroups] = useState([]);
@@ -969,18 +1148,75 @@ export default function App() {
   const searchActionLabel = showSearchLimit ? '搜索' : '打开';
   const tokenIndicator = token?.has_token ? '✓' : '✕';
   const tokenIndicatorClass = token?.has_token ? 'success' : 'error';
-  async function refreshBootstrap() {
-    const bootstrap = await window.deepxiv.bootstrap();
-    setToken(bootstrap.token);
+
+  function applyBootstrapData(bootstrap = {}, options = {}) {
+    const preserveAiForm = options.preserveAiForm === true;
+    setToken(bootstrap.token || null);
     setFavorites((bootstrap.favorites || []).map(normalizePaper));
     setFavoriteGroups(bootstrap.favoriteGroups || []);
     setHistory(bootstrap.history || []);
     const nextAiConfig = normalizeAiConfig(bootstrap.aiConfig || {});
     setAiConfig(nextAiConfig);
     setAiConfigStatus(normalizeAiConfigStatus(bootstrap.aiConfigStatus, nextAiConfig));
-    setAiConfigForm(nextAiConfig);
+    if (!preserveAiForm) {
+      setAiConfigForm(nextAiConfig);
+    }
     if (bootstrap.token?.token) {
       setTokenInput(bootstrap.token.token);
+    }
+    return nextAiConfig;
+  }
+
+  async function refreshBootstrap(options = {}) {
+    const bootstrap = await window.deepxiv.bootstrap();
+    applyBootstrapData(bootstrap, options);
+    return bootstrap;
+  }
+
+  async function performAnonymousRegistration(options = {}) {
+    const silentStatus = options.silentStatus === true;
+    setIsAutoRegistering(true);
+    setOnboardingMessage('正在为你自动匿名注册…');
+    if (!silentStatus) {
+      setStatusText('正在匿名注册…');
+    }
+    try {
+      const nextToken = await window.deepxiv.registerToken();
+      setToken(nextToken);
+      setTokenInput(nextToken?.token || '');
+      setOnboardingMessage('已自动完成匿名注册，可以直接开始使用。');
+      if (!silentStatus) {
+        setStatusText('匿名注册成功');
+      }
+      return nextToken;
+    } catch (error) {
+      const message = toUserErrorMessage(error, '匿名注册失败');
+      setOnboardingMessage(message);
+      if (!silentStatus) {
+        setStatusText(message);
+      }
+      throw error;
+    } finally {
+      setIsAutoRegistering(false);
+    }
+  }
+
+  async function initializeApp() {
+    setIsInitializing(true);
+    setOnboardingMessage('正在准备 DeepXiv…');
+    try {
+      const bootstrap = await refreshBootstrap();
+      if (bootstrap.token?.has_token) {
+        setOnboardingMessage('已自动连接 DeepXiv，可按需配置 AI 后进入软件。');
+      } else {
+        await performAnonymousRegistration({ silentStatus: true }).catch(() => {});
+      }
+    } catch (error) {
+      const message = toUserErrorMessage(error, '初始化失败');
+      setStatusText(message);
+      setOnboardingMessage(message);
+    } finally {
+      setIsInitializing(false);
     }
   }
 
@@ -995,6 +1231,8 @@ export default function App() {
       setAiConfigStatus(normalizeAiConfigStatus(result.aiConfigStatus, nextAiConfig));
       if (result.token?.token) {
         setTokenInput(result.token.token);
+      } else {
+        await performAnonymousRegistration({ silentStatus: true }).catch(() => {});
       }
       setStatusText('状态已刷新');
     } catch (error) {
@@ -1003,9 +1241,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    refreshBootstrap().catch(() => {
-      setStatusText('初始化失败');
-    });
+    initializeApp();
   }, []);
 
   useEffect(() => {
@@ -1267,29 +1503,45 @@ export default function App() {
   }
 
   async function handleRegisterToken() {
-    setStatusText('正在匿名注册…');
     try {
-      const nextToken = await window.deepxiv.registerToken();
-      setToken(nextToken);
-      setTokenInput(nextToken.token || '');
-      setStatusText('匿名注册成功');
+      await performAnonymousRegistration();
     } catch (error) {
-      setStatusText(toUserErrorMessage(error, '匿名注册失败'));
     }
   }
 
-  async function handleSaveAiConfig() {
-    setStatusText('正在保存 AI 配置…');
+  async function persistAiConfig(nextConfig = aiConfigForm, options = {}) {
+    const silentStatus = options.silentStatus === true;
+    setIsSavingAiConfig(true);
+    if (!silentStatus) {
+      setStatusText('正在保存 AI 配置…');
+    }
     try {
-      const saved = await window.deepxiv.saveAiConfig(aiConfigForm);
+      const saved = await window.deepxiv.saveAiConfig(nextConfig);
       const normalized = normalizeAiConfig(saved?.config || {});
       const nextStatus = normalizeAiConfigStatus(saved?.status, normalized);
       setAiConfig(normalized);
       setAiConfigForm(normalized);
       setAiConfigStatus(nextStatus);
-      setStatusText(nextStatus.ok ? 'AI 配置已保存并验证通过' : `AI 配置已保存，但当前不可用：${nextStatus.message}`);
+      const message = nextStatus.ok ? 'AI 配置已保存并验证通过' : `AI 配置已保存，但当前不可用：${nextStatus.message}`;
+      if (!silentStatus) {
+        setStatusText(message);
+      }
+      return { config: normalized, status: nextStatus };
     } catch (error) {
-      setStatusText(toUserErrorMessage(error, '保存 AI 配置失败'));
+      const message = toUserErrorMessage(error, '保存 AI 配置失败');
+      if (!silentStatus) {
+        setStatusText(message);
+      }
+      throw error;
+    } finally {
+      setIsSavingAiConfig(false);
+    }
+  }
+
+  async function handleSaveAiConfig() {
+    try {
+      await persistAiConfig();
+    } catch (error) {
     }
   }
 
@@ -1376,7 +1628,7 @@ export default function App() {
   }, []);
 
   const tokenStatusLabel = token?.has_token ? '已就绪' : '未配置';
-  const tokenStatusHint = token?.has_token ? (token?.daily_limit ? `每日额度 ${token.daily_limit}` : '可立即搜索与阅读') : '请先保存或匿名注册 Token';
+  const tokenStatusHint = token?.has_token ? (token?.daily_limit ? `每日额度 ${token.daily_limit}` : '可立即搜索与阅读') : '启动时会自动匿名注册，也可在此重新连接';
   const aiStatusLabel = aiConfigStatus?.ok
     ? 'AI 已就绪'
     : (aiConfig?.provider?.requiresOpenAIAuth && !aiConfig?.openAIApiKey ? 'AI 未配置' : 'AI 不可用');
@@ -1395,15 +1647,42 @@ export default function App() {
           : `${tokenStatusLabel} · ${aiStatusLabel}`
   );
 
+  if (showOnboarding) {
+    return (
+      <OnboardingView
+        token={token}
+        tokenStatusLabel={tokenStatusLabel}
+        tokenStatusHint={tokenStatusHint}
+        tokenIndicator={tokenIndicator}
+        tokenIndicatorClass={tokenIndicatorClass}
+        aiConfigForm={aiConfigForm}
+        aiConfigStatus={aiConfigStatus}
+        aiStatusLabel={aiStatusLabel}
+        aiStatusHint={aiStatusHint}
+        aiIndicator={aiIndicator}
+        aiIndicatorClass={aiIndicatorClass}
+        isInitializing={isInitializing}
+        isAutoRegistering={isAutoRegistering}
+        isSavingAiConfig={isSavingAiConfig}
+        onboardingMessage={onboardingMessage}
+        showOnboardingAiForm={showOnboardingAiForm}
+        onToggleAiForm={() => setShowOnboardingAiForm((prev) => !prev)}
+        onRetryConnection={() => performAnonymousRegistration()}
+        onContinue={() => {
+          setShowOnboarding(false);
+          setStatusText('');
+          setPage('search');
+        }}
+        onResetAiConfig={handleResetAiConfig}
+        onSaveAiConfig={handleSaveAiConfig}
+        updateAiFormField={updateAiFormField}
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
-      <div className="app-bg" aria-hidden="true">
-        <div className="app-bg-grid" />
-        <div className="app-bg-noise" />
-        <div className="app-bg-glow glow-blue" />
-        <div className="app-bg-glow glow-purple" />
-        <div className="app-bg-glow glow-teal" />
-      </div>
+      <AppBackground />
       <aside className="sidebar">
         <div className="window-controls" aria-hidden="true">
           <span className="window-dot red" />
@@ -1697,7 +1976,7 @@ export default function App() {
                 <input className="input" placeholder="粘贴 DEEPXIV_TOKEN" value={tokenInput} onChange={(event) => setTokenInput(event.target.value)} />
                 <div className="btn-row">
                   <button className="btn" onClick={handleSaveToken}>保存</button>
-                  <button className="btn primary" onClick={handleRegisterToken}>匿名注册</button>
+                  <button className="btn primary" onClick={handleRegisterToken}>重新匿名注册</button>
                   <button className="btn" onClick={handleRefreshStatus}>刷新状态</button>
                 </div>
               </div>

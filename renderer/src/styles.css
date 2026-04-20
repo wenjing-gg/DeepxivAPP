@@ -91,6 +91,166 @@ textarea {
   overflow: hidden;
 }
 
+.onboarding-shell {
+  position: relative;
+  min-height: 100vh;
+  padding: 18px;
+  overflow: auto;
+}
+
+.onboarding-layout {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(360px, 520px) minmax(0, 1fr);
+  gap: 18px;
+  min-height: calc(100vh - 36px);
+}
+
+.onboarding-hero,
+.onboarding-panel {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-radius: 30px;
+  padding: 18px;
+}
+
+.onboarding-hero {
+  gap: 18px;
+}
+
+.onboarding-brand {
+  padding: 0 6px;
+}
+
+.onboarding-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 6px;
+}
+
+.onboarding-copy h2,
+.onboarding-panel-header h3 {
+  margin: 0;
+  color: var(--text-strong);
+}
+
+.onboarding-copy h2 {
+  font-size: 40px;
+  line-height: 1.08;
+  letter-spacing: -0.05em;
+}
+
+.onboarding-copy p,
+.onboarding-note,
+.onboarding-footnote {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.onboarding-summary {
+  padding: 18px;
+  border-radius: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0.56));
+}
+
+.onboarding-step-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.onboarding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.onboarding-list-item {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 2px 12px;
+  align-items: start;
+}
+
+.onboarding-list-item span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 16px;
+  background: rgba(37, 99, 235, 0.08);
+  color: var(--primary-strong);
+  font-size: 12px;
+  font-weight: 900;
+  grid-row: 1 / span 2;
+}
+
+.onboarding-list-item strong,
+.onboarding-list-item em {
+  font-style: normal;
+}
+
+.onboarding-list-item strong {
+  color: var(--text-strong);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.onboarding-list-item em {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.onboarding-panel {
+  gap: 16px;
+}
+
+.onboarding-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.onboarding-section-card {
+  gap: 14px;
+}
+
+.onboarding-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.onboarding-form-grid {
+  margin-top: 2px;
+}
+
+.onboarding-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: auto;
+  padding: 4px 4px 0;
+}
+
+.onboarding-footnote {
+  flex: 1;
+}
+
 .app-bg {
   position: absolute;
   inset: 0;
@@ -379,6 +539,12 @@ textarea {
   color: var(--success);
   background: rgba(16, 185, 129, 0.12);
   border-color: rgba(16, 185, 129, 0.18);
+}
+
+.token-indicator.loading {
+  color: var(--primary-strong);
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.18);
 }
 
 .token-indicator.error {
@@ -1551,6 +1717,10 @@ textarea {
     grid-template-columns: 248px minmax(0, 1fr);
   }
 
+  .onboarding-layout {
+    grid-template-columns: minmax(320px, 460px) minmax(0, 1fr);
+  }
+
   .topbar {
     padding: 22px 24px;
   }
@@ -1607,8 +1777,13 @@ textarea {
 
   .split-layout,
   .settings-grid-wide,
-  .library-layout {
+  .library-layout,
+  .onboarding-layout {
     grid-template-columns: 1fr;
+  }
+
+  .onboarding-layout {
+    min-height: auto;
   }
 }
 
@@ -1618,11 +1793,17 @@ textarea {
     gap: 12px;
   }
 
+  .onboarding-shell {
+    padding: 12px;
+  }
+
   .sidebar,
   .topbar,
   .settings-card,
   .list-panel,
   .detail-panel,
+  .onboarding-hero,
+  .onboarding-panel,
   .toolbar {
     border-radius: 24px;
   }
@@ -1630,9 +1811,19 @@ textarea {
   .toolbar,
   .favorite-item-actions,
   .ai-chat-footer,
-  .btn-row {
+  .btn-row,
+  .onboarding-footer {
     flex-direction: column;
     grid-template-columns: 1fr;
+  }
+
+  .onboarding-panel-header,
+  .onboarding-section-head {
+    flex-direction: column;
+  }
+
+  .onboarding-copy h2 {
+    font-size: 30px;
   }
 
   .toolbar {
