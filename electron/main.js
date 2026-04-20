@@ -329,6 +329,19 @@ async function fileExists(filePath) {
   }
 }
 
+async function validatePdfFilePath(filePath) {
+  const target = String(filePath || '').trim();
+  if (!target) {
+    return false;
+  }
+  try {
+    await callBridge('validate-pdf-file', { path: target });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
 async function getCachedPdfStatus(normalized) {
   if (!normalized?.paperKey) {
     return null;
@@ -362,6 +375,12 @@ async function getCachedPdfStatus(normalized) {
     });
   }
   if (normalized.cachePath && await fileExists(normalized.cachePath)) {
+    const valid = await validatePdfFilePath(normalized.cachePath);
+    if (!valid) {
+      await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
+      pdfPrefetchStatuses.delete(normalized.paperKey);
+      return null;
+    }
     return emitPdfPrefetchStatus({
       paperKey: normalized.paperKey,
       title: normalized.title,
@@ -454,6 +473,11 @@ async function startPdfPrefetch(normalized) {
       if (isPmcOaCandidate(normalized)) {
         const pmcResult = await cachePmcPdfViaBridge(normalized, tempPath);
         await fsp.rename(pmcResult.cachedPath, normalized.cachePath);
+        const valid = await validatePdfFilePath(normalized.cachePath);
+        if (!valid) {
+          await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
+          throw new Error('缓存后的 PDF 文件无效');
+        }
         emitPdfPrefetchStatus({
           ...initialStatus,
           state: 'ready',
@@ -521,6 +545,11 @@ async function startPdfPrefetch(normalized) {
       }
 
       await fsp.rename(tempPath, normalized.cachePath);
+      const valid = await validatePdfFilePath(normalized.cachePath);
+      if (!valid) {
+        await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
+        throw new Error('缓存后的 PDF 文件无效');
+      }
 
       emitPdfPrefetchStatus({
         ...initialStatus,

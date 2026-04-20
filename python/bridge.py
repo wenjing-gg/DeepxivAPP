@@ -1107,6 +1107,30 @@ def cmd_cache_pmc_pdf(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def cmd_validate_pdf_file(payload: Dict[str, Any]) -> Dict[str, Any]:
+    file_path = normalize_spaces(payload.get("path"))
+    if not file_path:
+        raise ValueError("缺少 PDF 文件路径")
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        raise ValueError("PDF 文件不存在")
+
+    with path.open("rb") as handle:
+        header = handle.read(8)
+    if not header.startswith(b"%PDF"):
+        raise ValueError("文件不是有效 PDF")
+
+    reader = PdfReader(str(path))
+    page_count = len(reader.pages)
+    if page_count <= 0:
+        raise ValueError("PDF 页数异常")
+    return {
+        "path": str(path),
+        "pages": page_count,
+        "title": normalize_spaces((reader.metadata or {}).get("/Title") if reader.metadata else ""),
+    }
+
+
 def europepmc_source_meta(source_code: str) -> Dict[str, str]:
     code = str(source_code or "").strip().upper()
     mapping = {
@@ -1550,6 +1574,7 @@ COMMANDS = {
     "import-local-pdf": lambda payload: parse_local_pdf(str(payload.get("path") or "")),
     "section": cmd_section,
     "cache-pmc-pdf": cmd_cache_pmc_pdf,
+    "validate-pdf-file": cmd_validate_pdf_file,
 }
 
 
