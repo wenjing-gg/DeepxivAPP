@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import PdfReaderPane from './components/PdfReaderPane';
 
 function renderInlineMarkdown(text, keyPrefix = 'md-inline') {
   const source = String(text || '');
@@ -551,18 +552,6 @@ function resolveOpenTarget(snapshot, rawPaper) {
   return null;
 }
 
-function toEmbeddedPdfUrl(target) {
-  const value = String(target || '').trim();
-  if (!value) return '';
-  if (isRemoteHttpUrl(value)) return value;
-  return encodeURI(`file://${value}`);
-}
-
-function buildEmbeddedPdfSrc(target) {
-  const base = toEmbeddedPdfUrl(target).split('#')[0];
-  return base || '';
-}
-
 function buildPdfPrefetchPayload(snapshot, rawPaper) {
   const paper = normalizePaper(rawPaper || {});
   const target = resolveOpenTarget(snapshot, paper);
@@ -629,33 +618,9 @@ function TitleWithSource({ title, sourceKind, sourceLabel }) {
   );
 }
 
-function EmbeddedPdfPane({ viewer, onClose, pdfStatus }) {
-  if (!viewer?.target) return null;
-
-  const frameSrc = buildEmbeddedPdfSrc(viewer.target);
-  const pdfStatusText = formatPdfPrefetchMessage(pdfStatus);
-  const pdfStatusClass = pdfStatus?.state === 'ready'
-    ? 'ready'
-    : pdfStatus?.state === 'downloading'
-      ? 'downloading'
-      : pdfStatus?.state === 'error'
-        ? 'error'
-        : 'idle';
-
-  return (
-    <div className="embedded-pdf-pane">
-      <div className="embedded-pdf-toolbar">
-        <div className="embedded-pdf-toolbar-copy">
-          <div className="embedded-pdf-title">PDF 阅读</div>
-          {pdfStatusText && <div className={`embedded-pdf-status ${pdfStatusClass}`}>{pdfStatusText}</div>}
-        </div>
-        <div className="embedded-pdf-actions">
-          <button className="mini-btn" onClick={onClose}>关闭 PDF</button>
-        </div>
-      </div>
-      <iframe className="embedded-pdf-frame" src={frameSrc} title={viewer.title || '论文 PDF'} />
-    </div>
-  );
+function EmbeddedPdfPane({ viewer, onClose, pdfStatus, onLoadDocument }) {
+  if (!viewer?.target && !viewer?.payload) return null;
+  return <PdfReaderPane viewer={viewer} onClose={onClose} pdfStatus={pdfStatus} onLoadDocument={onLoadDocument} />;
 }
 
 function makeExternalSnapshot(paper) {
@@ -897,7 +862,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI, messa
   );
 }
 
-function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf, aiMessages, onAiMessagesChange, pdfStatus }) {
+function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf, aiMessages, onAiMessagesChange, pdfStatus, onLoadPdfDocument }) {
   const effectiveSnapshot = snapshot || (paper ? makeExternalSnapshot(paper) : null);
   if (!effectiveSnapshot) return <EmptyState text={emptyText} />;
 
@@ -920,6 +885,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
           viewer={embeddedPdf}
           onClose={onClosePdf}
           pdfStatus={pdfStatus}
+          onLoadDocument={onLoadPdfDocument}
         />
       </div>
     );
@@ -1060,24 +1026,6 @@ export default function App() {
   useEffect(() => {
     saveAiChatStore(aiChatStore);
   }, [aiChatStore]);
-
-  useEffect(() => {
-    setEmbeddedPdf((prev) => {
-      let changed = false;
-      const next = { ...prev };
-      for (const context of Object.keys(prev)) {
-        const viewer = prev[context];
-        if (!viewer?.target || !viewer?.paperKey) continue;
-        const status = pdfPrefetchStore[viewer.paperKey];
-        if (!status?.cachedPath || status.state !== 'ready') continue;
-        if (viewer.target === status.cachedPath) continue;
-        if (!isRemoteHttpUrl(viewer.target)) continue;
-        next[context] = { ...viewer, target: status.cachedPath };
-        changed = true;
-      }
-      return changed ? next : prev;
-    });
-  }, [pdfPrefetchStore]);
 
   function getAiConversationMessages(snapshot, paper) {
     const key = getAiConversationKey(snapshot, paper);
@@ -1405,16 +1353,27 @@ export default function App() {
     const target = resolveOpenTarget(snapshot, paper);
     if (!target?.value) return;
     if (target.kind === 'path' || looksLikePdfUrl(target.value)) {
+      const payload = buildPdfPrefetchPayload(snapshot, paper);
       const resolved = await resolvePdfOpenForPaper(snapshot, paper).catch(() => null);
       updateEmbeddedPdfViewer(context, {
         target: resolved?.openTarget || target.value,
         title: snapshot?.brief?.title || snapshot?.head?.title || paper?.title || '论文 PDF',
         paperKey: getPaperSessionKey(snapshot, paper),
+        payload: payload ? {
+          ...payload,
+          target: resolved?.openTarget || payload.target,
+          local_pdf_path: resolved?.cachedPath || payload.local_pdf_path,
+          pdf_url: resolved?.sourceUrl || payload.pdf_url,
+        } : null,
       });
       return;
     }
     await window.deepxiv.openExternal(target.value);
   }
+
+  const loadEmbeddedPdfDocument = useCallback(async (payload) => {
+    return window.deepxiv.loadPdfDocument(payload);
+  }, []);
 
   const tokenStatusLabel = token?.has_token ? '已就绪' : '未配置';
   const tokenStatusHint = token?.has_token ? (token?.daily_limit ? `每日额度 ${token.daily_limit}` : '可立即搜索与阅读') : '请先保存或匿名注册 Token';
@@ -1561,6 +1520,7 @@ export default function App() {
                   aiMessages={getAiConversationMessages(snapshots.search, activePaper.search)}
                   onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.search, activePaper.search, messages)}
                   pdfStatus={getPdfStatus(snapshots.search, activePaper.search)}
+                  onLoadPdfDocument={loadEmbeddedPdfDocument}
                 />
               </div>
             </div>
@@ -1685,6 +1645,7 @@ export default function App() {
                   aiMessages={getAiConversationMessages(snapshots.library, activePaper.library)}
                   onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.library, activePaper.library, messages)}
                   pdfStatus={getPdfStatus(snapshots.library, activePaper.library)}
+                  onLoadPdfDocument={loadEmbeddedPdfDocument}
                 />
               </div>
             </div>
@@ -1714,6 +1675,7 @@ export default function App() {
                   aiMessages={getAiConversationMessages(snapshots.history, activePaper.history)}
                   onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.history, activePaper.history, messages)}
                   pdfStatus={getPdfStatus(snapshots.history, activePaper.history)}
+                  onLoadPdfDocument={loadEmbeddedPdfDocument}
                 />
               </div>
             </div>

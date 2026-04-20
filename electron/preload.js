@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('deepxiv', {
   trending: (payload) => ipcRenderer.invoke('papers:trending', payload),
   prefetchPdf: (payload) => ipcRenderer.invoke('pdf:prefetch', payload),
   resolvePdf: (payload) => ipcRenderer.invoke('pdf:resolve', payload),
+  loadPdfDocument: (payload) => ipcRenderer.invoke('pdf:loadDocument', payload),
   snapshot: (payload) => ipcRenderer.invoke('papers:snapshot', payload),
   section: (payload) => ipcRenderer.invoke('papers:section', payload),
   favoritesList: () => ipcRenderer.invoke('favorites:list'),

@@ -555,6 +555,116 @@ async function resolvePdfForOpen(payload = {}) {
   };
 }
 
+function bufferToArrayBuffer(buffer) {
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+}
+
+async function fetchPdfBuffer(sourceUrl, normalized) {
+  const url = String(sourceUrl || '').trim();
+  if (!url) {
+    throw new Error('缺少 PDF 下载地址');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 180000);
+  try {
+    const response = await fetch(url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': `DeepXiv Client/${app.getVersion()}`,
+        'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`获取 PDF 失败（${response.status}）`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!validatePdfSignature(buffer.subarray(0, Math.min(buffer.length, 8)), response, normalized)) {
+      throw new Error('返回内容不是有效 PDF');
+    }
+    return {
+      buffer,
+      sourceUrl: response.url || url,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function ensurePdfReadyForRead(normalized) {
+  const cachedStatus = await getCachedPdfStatus(normalized);
+  if (cachedStatus?.state === 'ready' && cachedStatus.openTarget && !isRemoteHttpUrl(cachedStatus.openTarget)) {
+    return cachedStatus;
+  }
+
+  if (normalized.sourceUrl && looksLikePdfUrl(normalized.sourceUrl)) {
+    if (!pdfPrefetchTasks.get(normalized.paperKey)) {
+      await startPdfPrefetch(normalized);
+    }
+    const task = pdfPrefetchTasks.get(normalized.paperKey);
+    if (task) {
+      await task.catch(() => {});
+    }
+    const readyStatus = await getCachedPdfStatus(normalized);
+    if (readyStatus?.state === 'ready') {
+      return readyStatus;
+    }
+  }
+
+  return cachedStatus;
+}
+
+async function loadPdfDocument(payload = {}) {
+  const normalized = normalizePdfPayload(payload);
+  if (!normalized.paperKey || !normalized.target) {
+    throw new Error('未找到可用 PDF');
+  }
+
+  const readyStatus = await ensurePdfReadyForRead(normalized);
+  const openTarget = String(
+    readyStatus?.cachedPath
+    || readyStatus?.openTarget
+    || normalized.localPath
+    || normalized.sourceUrl
+    || normalized.target
+    || ''
+  ).trim();
+
+  if (!openTarget) {
+    throw new Error('未找到可打开的 PDF');
+  }
+
+  let buffer = null;
+  let sourceUrl = String(readyStatus?.sourceUrl || normalized.sourceUrl || '').trim();
+
+  if (!isRemoteHttpUrl(openTarget)) {
+    if (!(await fileExists(openTarget))) {
+      throw new Error('PDF 文件不存在');
+    }
+    buffer = await fsp.readFile(openTarget);
+  } else {
+    const fetched = await fetchPdfBuffer(openTarget, normalized);
+    buffer = fetched.buffer;
+    sourceUrl = fetched.sourceUrl;
+  }
+
+  if (!buffer?.byteLength) {
+    throw new Error('PDF 内容为空');
+  }
+
+  return {
+    paperKey: normalized.paperKey,
+    title: normalized.title,
+    openTarget,
+    sourceUrl,
+    isCached: readyStatus?.isCached === true,
+    isLocal: readyStatus?.isLocal === true || Boolean(normalized.localPath),
+    bytes: bufferToArrayBuffer(buffer),
+    byteLength: buffer.byteLength,
+  };
+}
+
 function normalizeFavoriteEntry(paper = {}, fallbackKey = '') {
   const sourceKind = String(paper.source_kind || (paper.local_pdf_path ? 'local-pdf' : paper.openalex_id ? 'openalex' : paper.europepmc_id ? 'europepmc' : paper.arxiv_id ? 'arxiv' : 'paper')).trim().toLowerCase() || 'paper';
   const sourceLabel = String(paper.source_label || (sourceKind === 'local-pdf' ? '本地 PDF' : '')).trim();
@@ -1504,6 +1614,7 @@ app.whenReady().then(() => {
   ipcMain.handle('ai:config:get', getAiConfig);
   ipcMain.handle('ai:config:save', (_, payload) => saveAiConfig(payload));
   ipcMain.handle('ai:chat', (_, payload) => callAi(payload));
+  ipcMain.handle('pdf:loadDocument', (_, payload) => loadPdfDocument(payload));
   ipcMain.handle('pdf:openViewer', (_, payload) => openPdfViewer(payload));
   ipcMain.handle('shell:openExternal', (_, url) => shell.openExternal(url));
   ipcMain.handle('shell:openPath', (_, targetPath) => openLocalPath(targetPath));

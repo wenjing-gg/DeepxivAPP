@@ -1113,6 +1113,7 @@ textarea {
   padding: 14px 18px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.12);
   background: rgba(255, 255, 255, 0.9);
+  flex-wrap: wrap;
 }
 
 .embedded-pdf-toolbar-copy {
@@ -1144,6 +1145,102 @@ textarea {
 
 .embedded-pdf-status.error {
   color: var(--warning);
+}
+
+.embedded-pdf-actions-wide {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.mini-btn.active {
+  color: white;
+  border-color: transparent;
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-strong) 100%);
+  box-shadow: 0 16px 28px rgba(37, 99, 235, 0.2);
+}
+
+.embedded-pdf-counter,
+.embedded-pdf-scale {
+  min-width: 64px;
+  padding: 9px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(255, 255, 255, 0.78);
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--text-strong);
+  text-align: center;
+}
+
+.embedded-pdf-stage {
+  position: relative;
+  min-height: 0;
+  overflow: auto;
+  padding: 22px;
+  background: linear-gradient(180deg, rgba(241, 245, 249, 0.9), rgba(226, 232, 240, 0.72));
+}
+
+.embedded-pdf-canvas-wrap,
+.embedded-pdf-loading,
+.embedded-pdf-error,
+.embedded-pdf-empty {
+  min-height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+}
+
+.embedded-pdf-canvas-wrap {
+  position: relative;
+  padding-bottom: 20px;
+}
+
+.embedded-pdf-canvas {
+  display: block;
+  max-width: 100%;
+  border-radius: 16px;
+  background: white;
+  box-shadow: 0 28px 60px rgba(15, 23, 42, 0.14);
+}
+
+.embedded-pdf-rendering {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.72);
+  color: white;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.embedded-pdf-loading,
+.embedded-pdf-error,
+.embedded-pdf-empty {
+  flex-direction: column;
+  gap: 10px;
+  padding: 36px 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.embedded-pdf-error strong {
+  color: var(--warning);
+}
+
+.embedded-pdf-spinner {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 2px solid rgba(37, 99, 235, 0.16);
+  border-top-color: var(--primary);
+  animation: embedded-pdf-spin 0.9s linear infinite;
+}
+
+@keyframes embedded-pdf-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .embedded-pdf-frame {
