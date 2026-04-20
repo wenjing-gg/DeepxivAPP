@@ -252,7 +252,13 @@ function toUserErrorMessage(error, fallback = '操作失败') {
 
 function looksLikePdfUrl(url) {
   const value = String(url || '').trim().toLowerCase();
-  return value.includes('.pdf') || value.includes('/pdf/') || value.includes('arxiv.org/pdf/');
+  return (
+    value.includes('.pdf')
+    || value.includes('/pdf/')
+    || value.includes('arxiv.org/pdf/')
+    || value.includes('/download/')
+    || /[?&](download=1|download=true|format=pdf|type=pdf)\b/.test(value)
+  );
 }
 
 function isRemoteHttpUrl(url) {
@@ -874,7 +880,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
   const authorLine = head.author_line || brief.author_line || paper?.author_line || '';
   const paperId = effectiveSnapshot.arxiv_id || effectiveSnapshot.openalex_id || effectiveSnapshot.europepmc_id || paper?.arxiv_id || paper?.openalex_id || paper?.europepmc_id || '';
   const meta = [authorLine, paperId, brief.publish_at || head.publish_at || paper?.publish_at || '', `引用 ${brief.citations || head.citations || 0}`].filter(Boolean).join(' · ');
-  const canOpenPdf = Boolean(buildPdfPrefetchPayload(effectiveSnapshot, paper));
+  const canOpenPdf = Boolean(pdfStatus?.state === 'ready' && (pdfStatus?.cachedPath || pdfStatus?.openTarget));
   const pdfStatusText = formatPdfPrefetchMessage(pdfStatus);
 
   if (embeddedPdf?.target) {
@@ -1077,8 +1083,9 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchSourceScope, setSearchSourceScope] = useState('mixed');
   const [searchMode] = useState('hybrid');
-  const [searchLimit, setSearchLimit] = useState(10);
+  const [searchLimit, setSearchLimit] = useState(20);
   const [searchResults, setSearchResults] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
   const [activePaper, setActivePaper] = useState({ search: null, library: null, history: null });
   const [snapshots, setSnapshots] = useState({ search: null, library: null, history: null });
   const [embeddedPdf, setEmbeddedPdf] = useState({ search: null, library: null, history: null });
@@ -1333,6 +1340,7 @@ export default function App() {
   async function handleSearch() {
     const query = searchQuery.trim();
     if (!query) return;
+    setIsSearching(true);
     setStatusText(showSearchLimit ? '正在搜索论文…' : '正在打开论文…');
     try {
       const result = await window.deepxiv.search({ query, limit: Number(searchLimit), mode: searchMode, source_scope: searchSourceScope });
@@ -1350,6 +1358,8 @@ export default function App() {
       setSnapshots((prev) => ({ ...prev, search: null }));
       setActivePaper((prev) => ({ ...prev, search: null }));
       setStatusText(toUserErrorMessage(error, '搜索失败'));
+    } finally {
+      setIsSearching(false);
     }
   }
 
@@ -1745,7 +1755,7 @@ export default function App() {
             <div className="mode-hint">{selectedSearchSource.label}：{selectedSearchSource.help}</div>
             <div className="split-layout">
               <div className="card list-panel">
-                <ResultList items={searchResults} activeId={activePaper.search?.paper_key} onSelect={(paper) => openPaper('search', paper)} emptyText="暂无结果" />
+                <ResultList items={searchResults} activeId={activePaper.search?.paper_key} onSelect={(paper) => openPaper('search', paper)} emptyText={isSearching ? '正在搜索中...' : '暂无结果'} />
               </div>
               <div className="card detail-panel">
                 <DetailView

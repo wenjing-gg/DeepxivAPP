@@ -208,7 +208,13 @@ function normalizeBaseUrl(url) {
 
 function looksLikePdfUrl(url) {
   const value = String(url || '').trim().toLowerCase();
-  return value.includes('.pdf') || value.includes('/pdf/') || value.includes('arxiv.org/pdf/');
+  return (
+    value.includes('.pdf')
+    || value.includes('/pdf/')
+    || value.includes('arxiv.org/pdf/')
+    || value.includes('/download/')
+    || /[?&](download=1|download=true|format=pdf|type=pdf)\b/.test(value)
+  );
 }
 
 function isRemoteHttpUrl(url) {
@@ -378,9 +384,6 @@ function validatePdfSignature(firstChunk, response, normalized) {
   }
   const buffer = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk || []);
   if (buffer.length >= 4 && buffer.subarray(0, 4).toString('latin1') === '%PDF') {
-    return true;
-  }
-  if (looksLikePdfUrl(response?.url || normalized?.sourceUrl || '')) {
     return true;
   }
   return false;

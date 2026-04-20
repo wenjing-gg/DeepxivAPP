@@ -348,6 +348,18 @@ def is_remote_http_url(url: str) -> bool:
     return bool(re.match(r"^https?://", str(url or "").strip(), re.IGNORECASE))
 
 
+def looks_like_probable_pdf_url(url: Any) -> bool:
+    value = str(url or "").strip()
+    if not value or not is_remote_http_url(value):
+        return False
+    lowered = value.lower()
+    if ".pdf" in lowered or "/pdf/" in lowered or "arxiv.org/pdf/" in lowered or "/download/" in lowered:
+        return True
+    parsed = urlsplit(value)
+    query = f"{parsed.query}&{parsed.fragment}".lower()
+    return any(token in query for token in ("download=1", "download=true", "format=pdf", "type=pdf"))
+
+
 def local_pdf_key(file_path: Path) -> str:
     return build_paper_key("local-pdf", str(file_path), file_path.stem)
 
@@ -985,6 +997,39 @@ def reconstruct_openalex_abstract(abstract_index: Any) -> str:
     return " ".join(word for word in words if word).strip()
 
 
+def pick_openalex_pdf_url(item: Dict[str, Any]) -> str:
+    best_location = item.get("best_oa_location") or {}
+    primary_location = item.get("primary_location") or {}
+    open_access = item.get("open_access") or {}
+    candidates = [
+        best_location.get("pdf_url"),
+        primary_location.get("pdf_url"),
+        open_access.get("oa_url"),
+    ]
+    for candidate in candidates:
+        url = normalize_spaces(candidate)
+        if looks_like_probable_pdf_url(url):
+            return url
+    return ""
+
+
+def pick_openalex_external_url(item: Dict[str, Any], pdf_url: str) -> str:
+    best_location = item.get("best_oa_location") or {}
+    primary_location = item.get("primary_location") or {}
+    candidates = [
+        best_location.get("landing_page_url"),
+        primary_location.get("landing_page_url"),
+        item.get("doi"),
+        item.get("id"),
+        pdf_url,
+    ]
+    for candidate in candidates:
+        url = normalize_spaces(candidate)
+        if url:
+            return url
+    return ""
+
+
 def europepmc_source_meta(source_code: str) -> Dict[str, str]:
     code = str(source_code or "").strip().upper()
     mapping = {
@@ -1029,20 +1074,14 @@ def normalize_openalex_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for authorship in (item.get("authorships") or [])
         if isinstance(authorship, dict)
     ]
-    primary_location = item.get("primary_location") or {}
-    open_access = item.get("open_access") or {}
-    pdf_url = str(primary_location.get("pdf_url") or "").strip() or str(open_access.get("oa_url") or "").strip()
-    src_url = (
-        str(primary_location.get("landing_page_url") or "").strip()
-        or pdf_url
-        or str(item.get("doi") or "").strip()
-        or str(item.get("id") or "").strip()
-    )
+    pdf_url = pick_openalex_pdf_url(item)
+    src_url = pick_openalex_external_url(item, pdf_url)
     publish_at = str(item.get("publication_date") or "").strip()
     if not publish_at and item.get("publication_year"):
         publish_at = f"{item['publication_year']}-01-01"
     doi = normalize_doi(item.get("doi") or item.get("ids", {}).get("doi"))
     abstract_text = reconstruct_openalex_abstract(item.get("abstract_inverted_index"))
+    arxiv_id = extract_arxiv_id(str(item.get("ids", {}).get("arxiv") or "")) or extract_arxiv_id(pdf_url) or extract_arxiv_id(src_url)
     return {
         **item,
         "paper_key": build_paper_key("openalex", openalex_id or doi, title),
@@ -1052,7 +1091,7 @@ def normalize_openalex_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "abstract": abstract_text,
         "author_line": to_author_line_from_names(authors),
         "publish_at": publish_at,
-        "arxiv_id": extract_arxiv_id(src_url),
+        "arxiv_id": arxiv_id,
         "openalex_id": openalex_id,
         "europepmc_id": "",
         "europepmc_source": "",
@@ -1209,7 +1248,7 @@ def cmd_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     query = str(payload.get("query") or "").strip()
     if not query:
         raise ValueError("请输入搜索关键词")
-    limit = max(1, min(int(payload.get("limit", 10)), 50))
+    limit = max(1, min(int(payload.get("limit", 20)), 50))
     mode = str(payload.get("mode") or "hybrid").strip() or "hybrid"
     source_scope = str(payload.get("source_scope") or "mixed").strip().lower()
 
