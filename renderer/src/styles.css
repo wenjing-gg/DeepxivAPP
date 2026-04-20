@@ -1026,6 +1026,10 @@ textarea {
   overflow: hidden;
 }
 
+.detail-reading-pane {
+  overflow: auto;
+}
+
 .detail-frame.pdf-only {
   height: 100%;
 }
@@ -1033,6 +1037,9 @@ textarea {
 .detail-shell {
   display: flex;
   flex-direction: column;
+  min-height: 100%;
+  overflow: auto;
+  padding-bottom: 18px;
 }
 
 .detail-header {
@@ -1476,7 +1483,7 @@ textarea {
 
 .ai-chat-panel.inline {
   position: relative;
-  flex: 1;
+  flex: 0 0 auto;
   min-height: 0;
   margin: 18px;
   min-height: 520px;

@@ -666,7 +666,8 @@ function makeExternalSnapshot(paper) {
   };
 }
 
-function ResultList({ items, activeId, onSelect, emptyText }) {
+function ResultList({ items, activeId, onSelect, emptyText, isLoading = false, loadingText = '正在搜索论文...' }) {
+  if (isLoading) return <EmptyState text={loadingText} />;
   if (!items.length) return <EmptyState text={emptyText} />;
 
   return (
@@ -1756,7 +1757,14 @@ export default function App() {
             <div className="mode-hint">{selectedSearchSource.label}：{selectedSearchSource.help}</div>
             <div className="split-layout">
               <div className="card list-panel">
-                <ResultList items={searchResults} activeId={activePaper.search?.paper_key} onSelect={(paper) => openPaper('search', paper)} emptyText={isSearching ? '正在搜索中...' : '暂无结果'} />
+                <ResultList
+                  items={searchResults}
+                  activeId={activePaper.search?.paper_key}
+                  onSelect={(paper) => openPaper('search', paper)}
+                  isLoading={isSearching}
+                  loadingText="正在搜索论文..."
+                  emptyText="暂无结果"
+                />
               </div>
               <div className="card detail-panel">
                 <DetailView
