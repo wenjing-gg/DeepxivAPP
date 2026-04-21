@@ -17,7 +17,9 @@ jobs:
         include:
           - os: macos-latest
             npm_script: dist:mac
-            asset_glob: release/*.dmg
+            asset_glob: |
+              release/*.dmg
+              release/*.app.zip
             artifact_name: mac-release
           - os: windows-latest
             npm_script: dist:win
@@ -122,6 +124,20 @@ jobs:
 
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}
+
+      - name: Package macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP_PATH="$(find release -maxdepth 2 -name 'DeepXiv Client.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "DeepXiv Client.app not found"
+            exit 1
+          fi
+          APP_DIR="$(dirname "$APP_PATH")"
+          APP_NAME="$(basename "$APP_PATH" .app)"
+          APP_VERSION="$(node -p "require('./package.json').version")"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_DIR/${APP_NAME}-${APP_VERSION}-arm64.app.zip"
 
       - name: Upload packaged artifacts
         if: startsWith(github.ref, 'refs/tags/')
