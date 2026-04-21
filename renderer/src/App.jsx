@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import PdfReaderPane from './components/PdfReaderPane';
 
 function renderInlineMarkdown(text, keyPrefix = 'md-inline') {
@@ -260,6 +260,7 @@ function looksLikePdfUrl(url) {
   return (
     value.includes('.pdf')
     || value.includes('/pdf/')
+    || value.includes('/pdfdirect/')
     || value.includes('arxiv.org/pdf/')
     || value.includes('/download/')
     || /[?&](download=1|download=true|format=pdf|type=pdf)\b/.test(value)
@@ -428,7 +429,73 @@ function normalizePdfPrefetchStatus(raw) {
     openTarget: String(next.openTarget || next.open_target || '').trim(),
     isCached: next.isCached === true,
     isLocal: next.isLocal === true,
+    reasonCode: String(next.reasonCode || next.reason_code || next.pdf_reason_code || '').trim(),
     error: String(next.error || '').trim(),
+    resolvedFromSibling: next.resolvedFromSibling === true || next.resolved_from_sibling === true,
+    resolvedFromPaperKey: String(next.resolvedFromPaperKey || next.resolved_from_paper_key || '').trim(),
+    resolvedSourceKind: String(next.resolvedSourceKind || next.resolved_source_kind || '').trim(),
+    resolvedSourceLabel: String(next.resolvedSourceLabel || next.resolved_source_label || '').trim(),
+    resolvedMatchReason: String(next.resolvedMatchReason || next.resolved_match_reason || '').trim(),
+    resolvedPaperTitle: String(next.resolvedPaperTitle || next.resolved_paper_title || '').trim(),
+  };
+}
+
+function normalizePdfCandidates(rawCandidates) {
+  if (!Array.isArray(rawCandidates)) return [];
+  const seen = new Set();
+  const candidates = [];
+  for (const rawCandidate of rawCandidates) {
+    const url = String(rawCandidate?.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) continue;
+    const kind = String(rawCandidate?.kind || '').trim().toLowerCase() || (looksLikePdfUrl(url) ? 'direct_pdf' : 'landing_page');
+    const key = `${kind}:${url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({
+      url,
+      kind,
+      source: String(rawCandidate?.source || '').trim(),
+      label: String(rawCandidate?.label || '').trim(),
+      host: String(rawCandidate?.host || '').trim(),
+      version: String(rawCandidate?.version || '').trim(),
+      license: String(rawCandidate?.license || '').trim(),
+      is_oa: rawCandidate?.is_oa === true,
+    });
+  }
+  return candidates;
+}
+
+function pdfCandidatePriority(candidate) {
+  const url = String(candidate?.url || '').trim().toLowerCase();
+  const source = String(candidate?.source || '').trim().toLowerCase();
+  let score = 100;
+  if (candidate?.kind === 'direct_pdf') score -= 20;
+  if (candidate?.kind === 'content_api') score += 35;
+  if (source.includes('arxiv') || url.includes('arxiv.org/')) score -= 50;
+  if (source.includes('pmc') || url.includes('ncbi.nlm.nih.gov')) score -= 45;
+  if (source.includes('open_access')) score -= 35;
+  if (url.includes('europepmc.org')) score -= 25;
+  if (url.includes('onlinelibrary.wiley.com') || url.includes('ieeexplore.ieee.org') || url.includes('dl.acm.org') || url.includes('pubs.acs.org')) score += 20;
+  return score;
+}
+
+const PDF_RESOLVING_HINT_DELAY_MS = 400;
+
+function hasReusablePdfStatus(status) {
+  if (!status) return false;
+  return !['idle', 'checking', ''].includes(String(status.state || '').trim());
+}
+
+function normalizePdfViewerState(raw) {
+  const next = raw || {};
+  const state = String(next.state || '').trim() || 'idle';
+  return {
+    paperKey: String(next.paperKey || next.paper_key || '').trim(),
+    requestId: String(next.requestId || next.request_id || '').trim(),
+    state,
+    message: String(next.message || '').trim(),
+    error: String(next.error || '').trim(),
+    hasLoaded: next.hasLoaded === true || state === 'loaded',
   };
 }
 
@@ -436,8 +503,18 @@ function formatPdfPrefetchMessage(status) {
   if (!status) return '';
   if (status.isLocal) return '本地 PDF，打开最快';
   if (status.state === 'ready' && status.cachedPath) return status.message || 'PDF 已缓存，下次打开更快';
+  if (status.state === 'checking') {
+    return status.message || '';
+  }
   if (status.state === 'downloading') {
-    return status.message || (status.progress > 0 ? `正在缓存 PDF… ${Math.round(status.progress * 100)}%` : '正在缓存 PDF…');
+    if (status.message) return status.message;
+    return status.progress > 0 ? `正在准备 PDF… ${Math.round(status.progress * 100)}%` : '正在准备 PDF…';
+  }
+  if (status.state === 'verifying') {
+    return status.message || '正在准备 PDF…';
+  }
+  if (status.state === 'missing') {
+    return status.message || '当前论文暂未提供可打开的 PDF';
   }
   if (status.state === 'error') {
     return status.message || 'PDF 缓存失败';
@@ -452,6 +529,7 @@ function normalizePaper(paper) {
   const europepmcId = String(paper?.europepmc_id || legacyPmcId || '').trim();
   const europepmcSource = String(paper?.europepmc_source || (legacyPmcId ? 'PMC' : '')).trim();
   const localPdfPath = String(paper?.local_pdf_path || '').trim();
+  const pmcid = String(paper?.pmcid || '').trim().toUpperCase();
   const sourceKind = String(
     paper?.source_kind
     || (localPdfPath ? 'local-pdf' : openalexId ? 'openalex' : europepmcId ? 'europepmc' : arxivId ? 'arxiv' : legacyPmcId ? 'pmc' : 'paper')
@@ -485,9 +563,20 @@ function normalizePaper(paper) {
     openalex_id: openalexId,
     europepmc_id: europepmcId,
     europepmc_source: europepmcSource,
+    pmcid,
+    doi: String(paper?.doi || '').trim(),
     external_url: externalUrl,
     pdf_url: pdfUrl,
     local_pdf_path: localPdfPath,
+    explicit_arxiv_id: paper?.explicit_arxiv_id === true,
+    pdf_reason_code: String(paper?.pdf_reason_code || '').trim(),
+    pdf_reason_message: String(paper?.pdf_reason_message || '').trim(),
+    pdf_candidates: normalizePdfCandidates(paper?.pdf_candidates),
+    openalex_content_url: String(paper?.openalex_content_url || '').trim(),
+    openalex_oa_url: String(paper?.openalex_oa_url || '').trim(),
+    openalex_oa_status: String(paper?.openalex_oa_status || '').trim(),
+    openalex_is_oa: paper?.openalex_is_oa === true,
+    openalex_has_content_pdf: paper?.openalex_has_content_pdf === true,
     group_id: String(paper?.group_id || '').trim() || 'default',
     abstract: String(paper?.abstract || paper?.snippet || '').trim(),
     author_line: paper?.author_line || (Array.isArray(paper?.author_names) ? paper.author_names.slice(0, 6).join(', ') : ''),
@@ -512,7 +601,15 @@ function resolvePdfUrl(snapshot, rawPaper) {
   const paper = normalizePaper(rawPaper || {});
   const brief = snapshot?.brief || {};
   const head = snapshot?.head || {};
-  const candidates = [head.pdf_url, brief.pdf_url, paper.pdf_url, head.src_url, brief.src_url];
+  const directCandidates = [
+    ...normalizePdfCandidates(head.pdf_candidates),
+    ...normalizePdfCandidates(brief.pdf_candidates),
+    ...(paper.pdf_candidates || []),
+  ].filter((candidate) => candidate.kind !== 'content_api');
+  const candidateUrls = directCandidates
+    .sort((left, right) => pdfCandidatePriority(left) - pdfCandidatePriority(right))
+    .map((candidate) => candidate.url);
+  const candidates = [head.pdf_url, brief.pdf_url, paper.pdf_url, ...candidateUrls, head.src_url, brief.src_url];
   for (const candidate of candidates) {
     const url = String(candidate || '').trim();
     if (url && looksLikePdfUrl(url)) {
@@ -522,7 +619,8 @@ function resolvePdfUrl(snapshot, rawPaper) {
       return url;
     }
   }
-  if (paper.arxiv_id) {
+  const hasExplicitArxivId = head.explicit_arxiv_id === true || brief.explicit_arxiv_id === true || paper.explicit_arxiv_id === true;
+  if (paper.arxiv_id && hasExplicitArxivId) {
     return `https://arxiv.org/pdf/${paper.arxiv_id}.pdf`;
   }
   const pmcid = String(head.pmcid || brief.pmcid || paper.pmcid || '').trim().toUpperCase();
@@ -530,6 +628,31 @@ function resolvePdfUrl(snapshot, rawPaper) {
     return `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/pdf/`;
   }
   return '';
+}
+
+function derivePdfReason(snapshot, rawPaper) {
+  const paper = normalizePaper(rawPaper || {});
+  const brief = snapshot?.brief || {};
+  const head = snapshot?.head || {};
+  const reasonCode = String(head.pdf_reason_code || brief.pdf_reason_code || paper.pdf_reason_code || '').trim();
+  const reasonMessage = String(head.pdf_reason_message || brief.pdf_reason_message || paper.pdf_reason_message || '').trim();
+  const localPdfPath = resolveLocalPdfPath(snapshot, paper);
+  if (localPdfPath) {
+    return { code: reasonCode || 'ready_local', message: reasonMessage || '本地 PDF 已就绪' };
+  }
+  const pdfUrl = resolvePdfUrl(snapshot, paper);
+  if (pdfUrl) {
+    const pmcid = String(head.pmcid || brief.pmcid || paper.pmcid || '').trim().toUpperCase();
+    if (pmcid.startsWith('PMC') && paper.source_kind !== 'local-pdf') {
+      return { code: reasonCode || 'needs_pmc_resolution', message: reasonMessage || '正在准备 PDF…可稍后打开' };
+    }
+    return { code: reasonCode || 'ready_remote', message: reasonMessage || '已发现可缓存 PDF' };
+  }
+  const externalUrl = String(head.src_url || brief.src_url || paper.external_url || '').trim();
+  if (externalUrl) {
+    return { code: reasonCode || 'landing_page_only', message: reasonMessage || '源站仅提供论文落地页，未发现可用 PDF' };
+  }
+  return { code: reasonCode || 'no_open_access_pdf', message: reasonMessage || '源站未提供可用 PDF' };
 }
 
 function resolveLocalPdfPath(snapshot, rawPaper) {
@@ -566,10 +689,15 @@ function resolveOpenTarget(snapshot, rawPaper) {
 function buildPdfPrefetchPayload(snapshot, rawPaper) {
   const paper = normalizePaper(rawPaper || {});
   const target = resolveOpenTarget(snapshot, paper);
-  if (!target?.value) return null;
-  if (target.kind !== 'path' && !looksLikePdfUrl(target.value)) {
-    return null;
-  }
+  const pdfReason = derivePdfReason(snapshot, paper);
+  const fallbackTarget = String(snapshot?.head?.src_url || snapshot?.brief?.src_url || paper.external_url || '').trim();
+  const targetValue = String(target?.value || fallbackTarget || '').trim();
+  const targetKind = String(target?.kind || (isRemoteHttpUrl(targetValue) ? 'url' : 'path')).trim().toLowerCase() || 'path';
+  const pdfCandidates = normalizePdfCandidates([
+    ...(snapshot?.head?.pdf_candidates || []),
+    ...(snapshot?.brief?.pdf_candidates || []),
+    ...(paper.pdf_candidates || []),
+  ]);
 
   return {
     paper_key: paper.paper_key,
@@ -581,12 +709,24 @@ function buildPdfPrefetchPayload(snapshot, rawPaper) {
     europepmc_id: snapshot?.europepmc_id || paper.europepmc_id,
     europepmc_source: snapshot?.europepmc_source || paper.europepmc_source,
     pmcid: snapshot?.head?.pmcid || snapshot?.brief?.pmcid || paper.pmcid || '',
+    explicit_arxiv_id: snapshot?.head?.explicit_arxiv_id === true || snapshot?.brief?.explicit_arxiv_id === true || paper.explicit_arxiv_id === true,
     title: snapshot?.brief?.title || snapshot?.head?.title || paper.title || '论文 PDF',
+    author_line: snapshot?.head?.author_line || snapshot?.brief?.author_line || paper.author_line || '',
+    publish_at: snapshot?.brief?.publish_at || snapshot?.head?.publish_at || paper.publish_at || '',
+    doi: snapshot?.head?.doi || paper.doi || '',
     external_url: snapshot?.head?.src_url || snapshot?.brief?.src_url || paper.external_url || '',
     pdf_url: resolvePdfUrl(snapshot, paper),
+    pdf_candidates: pdfCandidates,
+    pdf_reason_code: pdfReason.code,
+    pdf_reason_message: pdfReason.message,
     local_pdf_path: resolveLocalPdfPath(snapshot, paper),
-    target: target.value,
-    target_kind: target.kind,
+    openalex_content_url: String(snapshot?.head?.openalex_content_url || paper.openalex_content_url || '').trim(),
+    openalex_oa_url: String(snapshot?.head?.openalex_oa_url || paper.openalex_oa_url || '').trim(),
+    openalex_oa_status: String(snapshot?.head?.openalex_oa_status || paper.openalex_oa_status || '').trim(),
+    openalex_is_oa: snapshot?.head?.openalex_is_oa === true || paper.openalex_is_oa === true,
+    openalex_has_content_pdf: snapshot?.head?.openalex_has_content_pdf === true || paper.openalex_has_content_pdf === true,
+    target: targetValue,
+    target_kind: targetKind,
   };
 }
 
@@ -624,7 +764,7 @@ function buildSnapshotPayload(paper, options = {}) {
   return basePayload;
 }
 
-function buildAiPaperContext(snapshot, rawPaper) {
+function buildAiPaperContext(snapshot, rawPaper, pdfStatus = null) {
   const paper = normalizePaper(rawPaper || {});
   const brief = snapshot?.brief || {};
   const head = snapshot?.head || {};
@@ -643,6 +783,9 @@ function buildAiPaperContext(snapshot, rawPaper) {
     sourceUrl: head.src_url || brief.src_url || paper.external_url || '',
     pdfUrl: resolvePdfUrl(snapshot, paper),
     contextText: String(head.full_context_text || paper.full_context_text || '').trim(),
+    resolvedFromSibling: pdfStatus?.resolvedFromSibling === true,
+    pdfSourceKind: String(pdfStatus?.resolvedSourceKind || '').trim(),
+    pdfSourceLabel: String(pdfStatus?.resolvedSourceLabel || '').trim(),
   };
 }
 
@@ -664,9 +807,9 @@ function TitleWithSource({ title, sourceKind, sourceLabel }) {
   );
 }
 
-function EmbeddedPdfPane({ viewer, onClose, pdfStatus, onLoadDocument }) {
+function EmbeddedPdfPane({ viewer, onClose, pdfStatus, onLoadDocument, onViewerStateChange }) {
   if (!viewer?.target && !viewer?.payload) return null;
-  return <PdfReaderPane viewer={viewer} onClose={onClose} pdfStatus={pdfStatus} onLoadDocument={onLoadDocument} />;
+  return <PdfReaderPane viewer={viewer} onClose={onClose} pdfStatus={pdfStatus} onLoadDocument={onLoadDocument} onViewerStateChange={onViewerStateChange} />;
 }
 
 function makeExternalSnapshot(paper) {
@@ -680,6 +823,7 @@ function makeExternalSnapshot(paper) {
     openalex_id: normalized.openalex_id,
     europepmc_id: normalized.europepmc_id,
     europepmc_source: normalized.europepmc_source,
+    pmcid: normalized.pmcid || '',
     brief: {
       title: normalized.title,
       tldr: normalized.abstract,
@@ -687,6 +831,11 @@ function makeExternalSnapshot(paper) {
       publish_at: normalized.publish_at || '',
       src_url: srcUrl,
       pdf_url: normalized.pdf_url || '',
+      pmcid: normalized.pmcid || '',
+      explicit_arxiv_id: normalized.explicit_arxiv_id === true,
+      pdf_reason_code: normalized.pdf_reason_code || '',
+      pdf_reason_message: normalized.pdf_reason_message || '',
+      pdf_candidates: normalized.pdf_candidates || [],
       citations: normalized.citation || normalized.citations || 0,
     },
     head: {
@@ -697,6 +846,16 @@ function makeExternalSnapshot(paper) {
       src_url: srcUrl,
       pdf_url: normalized.pdf_url || '',
       local_pdf_path: normalized.local_pdf_path || '',
+      pmcid: normalized.pmcid || '',
+      explicit_arxiv_id: normalized.explicit_arxiv_id === true,
+      pdf_reason_code: normalized.pdf_reason_code || '',
+      pdf_reason_message: normalized.pdf_reason_message || '',
+      pdf_candidates: normalized.pdf_candidates || [],
+      openalex_content_url: normalized.openalex_content_url || '',
+      openalex_oa_url: normalized.openalex_oa_url || '',
+      openalex_oa_status: normalized.openalex_oa_status || '',
+      openalex_is_oa: normalized.openalex_is_oa === true,
+      openalex_has_content_pdf: normalized.openalex_has_content_pdf === true,
       full_context_text: normalized.full_context_text || '',
       contribution_points: normalized.contribution_points || [],
       citations: normalized.citation || normalized.citations || 0,
@@ -772,25 +931,31 @@ function HistoryList({ items, activeKey, onSelect, emptyText }) {
   );
 }
 
-function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI, messages = [], onMessagesChange }) {
+function AIChatPanel({ snapshot, paper, pdfStatus, pdfViewerState, aiConfig, aiConfigStatus, onAskAI, messages = [], onMessagesChange }) {
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(false);
   const snapshotKey = snapshot?.arxiv_id || snapshot?.openalex_id || snapshot?.europepmc_id || paper?.paper_key || paper?.title || '';
-  const paperContext = useMemo(() => buildAiPaperContext(snapshot, paper), [snapshot, paper, snapshotKey]);
+  const paperContext = useMemo(() => buildAiPaperContext(snapshot, paper, pdfStatus), [snapshot, paper, pdfStatus, snapshotKey]);
   const needsAuth = aiConfig?.provider?.requiresOpenAIAuth !== false;
   const hasApiKey = Boolean(aiConfig?.openAIApiKey);
   const validated = !needsAuth || aiConfigStatus?.ok === true;
   const ready = !needsAuth ? true : hasApiKey && validated;
   const hasTextContext = Boolean(paperContext.contextText);
-  const hasPdfContext = Boolean(paperContext.pdfUrl);
+  const candidatePdfUrl = String(pdfStatus?.sourceUrl || paperContext.pdfUrl || '').trim();
+  const hasPdfContext = pdfViewerState?.hasLoaded === true && isRemoteHttpUrl(candidatePdfUrl) && looksLikePdfUrl(candidatePdfUrl);
+  const effectivePaperContext = useMemo(() => ({
+    ...paperContext,
+    pdfLoaded: hasPdfContext,
+    pdfUrl: hasPdfContext ? candidatePdfUrl : '',
+  }), [paperContext, hasPdfContext, candidatePdfUrl]);
   const readinessHint = !hasApiKey
     ? '请先在设置中填写 OPENAI_API_KEY'
     : (aiConfigStatus?.message || '请先在设置页保存并验证 AI 配置');
   const contextStatus = hasPdfContext
-    ? '已附带 PDF 原文上下文'
+    ? (paperContext.resolvedFromSibling ? `已附带开放兄弟版本 PDF 上下文${paperContext.pdfSourceLabel ? `（${paperContext.pdfSourceLabel}）` : ''}` : '已附带 PDF 原文上下文')
     : hasTextContext
       ? '已附带论文正文摘录上下文'
-      : '未找到 PDF，已回退为标题与摘要上下文';
+      : '未附带 PDF 原文，仅使用标题与摘要上下文';
 
   useEffect(() => {
     setDraft('');
@@ -806,7 +971,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI, messa
     setDraft('');
     setLoading(true);
     try {
-      const result = await onAskAI({ paperContext, messages: history, prompt });
+      const result = await onAskAI({ paperContext: effectivePaperContext, messages: history, prompt });
       onMessagesChange?.([...nextUserMessages, {
         role: 'assistant',
         content: result.answer,
@@ -909,7 +1074,7 @@ function AIChatPanel({ snapshot, paper, aiConfig, aiConfigStatus, onAskAI, messa
   );
 }
 
-function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf, aiMessages, onAiMessagesChange, pdfStatus, onLoadPdfDocument }) {
+function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite, onOpenPdf, emptyText, aiConfig, aiConfigStatus, onAskAI, embeddedPdf, onClosePdf, aiMessages, onAiMessagesChange, pdfStatus, pdfViewerState, onLoadPdfDocument, onPdfViewerStateChange }) {
   const effectiveSnapshot = snapshot || (paper ? makeExternalSnapshot(paper) : null);
   if (!effectiveSnapshot) return <EmptyState text={emptyText} />;
 
@@ -922,7 +1087,16 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
   const paperId = effectiveSnapshot.arxiv_id || effectiveSnapshot.openalex_id || effectiveSnapshot.europepmc_id || paper?.arxiv_id || paper?.openalex_id || paper?.europepmc_id || '';
   const meta = [authorLine, paperId, brief.publish_at || head.publish_at || paper?.publish_at || '', `引用 ${brief.citations || head.citations || 0}`].filter(Boolean).join(' · ');
   const canOpenPdf = Boolean(pdfStatus?.state === 'ready' && (pdfStatus?.cachedPath || pdfStatus?.openTarget));
-  const pdfStatusText = formatPdfPrefetchMessage(pdfStatus);
+  const isOpeningPdf = pdfViewerState?.state === 'loading';
+  const fallbackPdfReason = derivePdfReason(effectiveSnapshot, paper);
+  const formattedPdfStatus = formatPdfPrefetchMessage(pdfStatus);
+  const pdfStatusText = isOpeningPdf
+    ? (pdfViewerState?.message || '正在打开 PDF…')
+    : (pdfViewerState?.state === 'error'
+      ? (pdfViewerState?.message || pdfViewerState?.error || 'PDF 打开失败')
+      : (pdfStatus?.state === 'checking'
+        ? formattedPdfStatus
+        : (formattedPdfStatus || fallbackPdfReason.message)));
 
   if (embeddedPdf?.target) {
     return (
@@ -932,6 +1106,7 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
           onClose={onClosePdf}
           pdfStatus={pdfStatus}
           onLoadDocument={onLoadPdfDocument}
+          onViewerStateChange={onPdfViewerStateChange}
         />
       </div>
     );
@@ -949,11 +1124,21 @@ function DetailView({ snapshot, paper, isFavorite, canFavorite, onToggleFavorite
           <div className="detail-meta">{meta}</div>
           <div className="detail-actions">
             <button className="btn" disabled={!canFavorite} onClick={onToggleFavorite}>{canFavorite ? (isFavorite ? '取消收藏' : '加入收藏') : '暂不支持收藏'}</button>
-            <button className="btn" disabled={!canOpenPdf} onClick={onOpenPdf}>打开 PDF</button>
+            <button className="btn" disabled={!canOpenPdf || isOpeningPdf} onClick={onOpenPdf}>{isOpeningPdf ? '正在打开…' : '打开 PDF'}</button>
           </div>
           {pdfStatusText && <div className={`pdf-prefetch-hint ${pdfStatus?.state || 'idle'}`}>{pdfStatusText}</div>}
         </div>
-          <AIChatPanel snapshot={effectiveSnapshot} paper={paper} aiConfig={aiConfig} aiConfigStatus={aiConfigStatus} onAskAI={onAskAI} messages={aiMessages} onMessagesChange={onAiMessagesChange} />
+          <AIChatPanel
+            snapshot={effectiveSnapshot}
+            paper={paper}
+            pdfStatus={pdfStatus}
+            pdfViewerState={pdfViewerState}
+            aiConfig={aiConfig}
+            aiConfigStatus={aiConfigStatus}
+            onAskAI={onAskAI}
+            messages={aiMessages}
+            onMessagesChange={onAiMessagesChange}
+          />
         </div>
       </div>
 
@@ -1104,6 +1289,10 @@ function OnboardingView({
 }
 
 export default function App() {
+  const openPaperRequestRef = useRef({ search: 0, library: 0, history: 0 });
+  const pdfOpenRequestRef = useRef({ search: 0, library: 0, history: 0 });
+  const activePaperKeyRef = useRef({ search: '', library: '', history: '' });
+  const pdfResolveHintTimerRef = useRef({ search: null, library: null, history: null });
   const [page, setPage] = useState('search');
   const [statusText, setStatusText] = useState('');
   const [isInitializing, setIsInitializing] = useState(true);
@@ -1137,6 +1326,8 @@ export default function App() {
   const [aiConfigForm, setAiConfigForm] = useState(normalizeAiConfig());
   const [aiChatStore, setAiChatStore] = useState(() => loadAiChatStore());
   const [pdfPrefetchStore, setPdfPrefetchStore] = useState({});
+  const [pdfViewerStateStore, setPdfViewerStateStore] = useState({});
+  const pdfPrefetchStoreRef = useRef({});
 
   const pageMeta = PAGE_META[page];
   const favoriteKeys = useMemo(() => new Set(favorites.map((item) => getFavoriteKey(item)).filter(Boolean)), [favorites]);
@@ -1267,13 +1458,39 @@ export default function App() {
   }, [favoriteGroups, activeGroupId]);
 
   useEffect(() => {
+    activePaperKeyRef.current = {
+      search: getPaperSessionKey(snapshots.search, activePaper.search),
+      library: getPaperSessionKey(snapshots.library, activePaper.library),
+      history: getPaperSessionKey(snapshots.history, activePaper.history),
+    };
+  }, [snapshots, activePaper]);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of Object.values(pdfResolveHintTimerRef.current || {})) {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     const unsubscribe = window.deepxiv.onPdfPrefetchStatus?.((payload) => {
       const status = normalizePdfPrefetchStatus(payload);
       if (!status.paperKey) return;
-      setPdfPrefetchStore((prev) => ({ ...prev, [status.paperKey]: status }));
+      setPdfPrefetchStore((prev) => {
+        const next = { ...prev, [status.paperKey]: status };
+        pdfPrefetchStoreRef.current = next;
+        return next;
+      });
     });
     return () => unsubscribe?.();
   }, []);
+
+  useEffect(() => {
+    pdfPrefetchStoreRef.current = pdfPrefetchStore;
+  }, [pdfPrefetchStore]);
 
   useEffect(() => {
     saveAiChatStore(aiChatStore);
@@ -1302,18 +1519,95 @@ export default function App() {
   function mergePdfPrefetchStatus(rawStatus) {
     const status = normalizePdfPrefetchStatus(rawStatus);
     if (!status.paperKey) return status;
-    setPdfPrefetchStore((prev) => ({ ...prev, [status.paperKey]: status }));
+    setPdfPrefetchStore((prev) => {
+      const next = { ...prev, [status.paperKey]: status };
+      pdfPrefetchStoreRef.current = next;
+      return next;
+    });
     return status;
   }
 
+  const mergePdfViewerState = useCallback((rawState) => {
+    const next = normalizePdfViewerState(rawState);
+    if (!next.paperKey) return next;
+    setPdfViewerStateStore((prev) => {
+      const current = normalizePdfViewerState(prev[next.paperKey] || {});
+      const merged = {
+        ...current,
+        ...next,
+        hasLoaded: current.hasLoaded || next.hasLoaded,
+      };
+      if (
+        current.paperKey === merged.paperKey
+        && current.requestId === merged.requestId
+        && current.state === merged.state
+        && current.message === merged.message
+        && current.error === merged.error
+        && current.hasLoaded === merged.hasLoaded
+      ) {
+        return prev;
+      }
+      return { ...prev, [next.paperKey]: merged };
+    });
+    return next;
+  }, []);
+
   function getPdfStatus(snapshot, paper) {
     const key = getPaperSessionKey(snapshot, paper);
-    return key ? (pdfPrefetchStore[key] || null) : null;
+    return key ? (pdfPrefetchStoreRef.current[key] || null) : null;
+  }
+
+  function getPdfViewerState(snapshot, paper) {
+    const key = getPaperSessionKey(snapshot, paper);
+    return key ? (pdfViewerStateStore[key] || null) : null;
+  }
+
+  function markPdfChecking(snapshot, paper, message = '正在检查 PDF…') {
+    const payload = buildPdfPrefetchPayload(snapshot, paper);
+    if (!payload?.favorite_key) return null;
+    return mergePdfPrefetchStatus({
+      paperKey: payload.favorite_key,
+      state: 'checking',
+      message,
+      target: payload.target || '',
+      sourceUrl: payload.pdf_url || '',
+      openTarget: payload.target || '',
+      reasonCode: payload.pdf_reason_code || '',
+      isLocal: Boolean(payload.local_pdf_path),
+      isCached: false,
+    });
+  }
+
+  function clearPdfResolveHint(context) {
+    const timer = pdfResolveHintTimerRef.current?.[context];
+    if (timer) {
+      clearTimeout(timer);
+    }
+    pdfResolveHintTimerRef.current = {
+      ...pdfResolveHintTimerRef.current,
+      [context]: null,
+    };
+  }
+
+  function schedulePdfResolveHint(context, requestId, snapshot, paper) {
+    clearPdfResolveHint(context);
+    const payload = buildPdfPrefetchPayload(snapshot, paper);
+    if (!payload?.favorite_key) return;
+    if (hasReusablePdfStatus(pdfPrefetchStoreRef.current[payload.favorite_key] || null)) return;
+    const timer = setTimeout(() => {
+      if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
+      if (activePaperKeyRef.current[context] && activePaperKeyRef.current[context] !== payload.favorite_key) return;
+      if (hasReusablePdfStatus(pdfPrefetchStoreRef.current[payload.favorite_key] || null)) return;
+      markPdfChecking(snapshot, paper, '正在加载论文信息…');
+    }, PDF_RESOLVING_HINT_DELAY_MS);
+    pdfResolveHintTimerRef.current = {
+      ...pdfResolveHintTimerRef.current,
+      [context]: timer,
+    };
   }
 
   async function prefetchPdfForPaper(snapshot, paper) {
     const payload = buildPdfPrefetchPayload(snapshot, paper);
-    if (!payload) return null;
     try {
       return mergePdfPrefetchStatus(await window.deepxiv.prefetchPdf(payload));
     } catch (error) {
@@ -1323,7 +1617,6 @@ export default function App() {
 
   async function resolvePdfOpenForPaper(snapshot, paper) {
     const payload = buildPdfPrefetchPayload(snapshot, paper);
-    if (!payload) return null;
     return mergePdfPrefetchStatus(await window.deepxiv.resolvePdf(payload));
   }
 
@@ -1331,28 +1624,71 @@ export default function App() {
     const paper = normalizePaper(rawPaper);
     const canLoadSnapshot = Boolean(paper.arxiv_id || paper.openalex_id || paper.europepmc_id || paper.local_pdf_path || paper.source_kind === 'local-pdf');
     const previewSnapshot = makeExternalSnapshot(paper);
+    const previewPaperKey = getPaperSessionKey(previewSnapshot, paper);
+    const requestId = bumpContextRequest(openPaperRequestRef, context);
+    bumpContextRequest(pdfOpenRequestRef, context);
+    activePaperKeyRef.current = { ...activePaperKeyRef.current, [context]: previewPaperKey };
     setActivePaper((prev) => ({ ...prev, [context]: paper }));
     setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
     setEmbeddedPdf((prev) => ({ ...prev, [context]: null }));
-    void prefetchPdfForPaper(previewSnapshot, paper);
+    clearPdfResolveHint(context);
+    const existingPreviewPdfStatus = getPdfStatus(previewSnapshot, paper);
+    const reusePreviewPdfStatus = hasReusablePdfStatus(existingPreviewPdfStatus);
+    if (paper.local_pdf_path || paper.source_kind === 'local-pdf') {
+      if (!reusePreviewPdfStatus) {
+        void prefetchPdfForPaper(previewSnapshot, paper);
+      }
+    } else if (!canLoadSnapshot) {
+      if (!reusePreviewPdfStatus) {
+        void prefetchPdfForPaper(previewSnapshot, paper);
+      }
+    } else if (canLoadSnapshot) {
+      if (!reusePreviewPdfStatus) {
+        markPdfChecking(previewSnapshot, paper, '');
+        schedulePdfResolveHint(context, requestId, previewSnapshot, paper);
+      }
+    }
     try {
       if (canLoadSnapshot) {
         const snapshot = await window.deepxiv.snapshot(buildSnapshotPayload(paper, options));
+        clearPdfResolveHint(context);
+        if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
+        activePaperKeyRef.current = { ...activePaperKeyRef.current, [context]: getPaperSessionKey(snapshot, paper) || previewPaperKey };
         setSnapshots((prev) => ({ ...prev, [context]: snapshot }));
-        void prefetchPdfForPaper(snapshot, paper);
+        const existingSnapshotPdfStatus = getPdfStatus(snapshot, paper) || existingPreviewPdfStatus;
+        if (!hasReusablePdfStatus(existingSnapshotPdfStatus)) {
+          markPdfChecking(snapshot, paper, '');
+          void prefetchPdfForPaper(snapshot, paper);
+        }
         if (options.trackHistory !== false) {
           const nextHistory = await window.deepxiv.historyList();
+          if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
           setHistory(nextHistory || []);
         }
       } else {
+        clearPdfResolveHint(context);
+        if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
         setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
         if (options.trackHistory !== false) {
           const nextHistory = await window.deepxiv.historyAdd({ kind: 'paper', payload: paper });
+          if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
           setHistory(nextHistory || []);
         }
       }
     } catch (error) {
+      clearPdfResolveHint(context);
+      if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
       setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
+      if (!reusePreviewPdfStatus) {
+        mergePdfPrefetchStatus({
+          paperKey: previewPaperKey,
+          state: 'error',
+          message: '加载详情失败，暂时无法检查 PDF',
+          error: toUserErrorMessage(error, '加载详情失败'),
+          target: buildPdfPrefetchPayload(previewSnapshot, paper)?.target || '',
+          sourceUrl: buildPdfPrefetchPayload(previewSnapshot, paper)?.pdf_url || '',
+        });
+      }
       setStatusText(toUserErrorMessage(error, '加载详情失败'));
     }
   }
@@ -1360,21 +1696,30 @@ export default function App() {
   async function handleSearch() {
     const query = searchQuery.trim();
     if (!query) return;
+    clearPdfResolveHint('search');
+    bumpContextRequest(openPaperRequestRef, 'search');
+    bumpContextRequest(pdfOpenRequestRef, 'search');
+    activePaperKeyRef.current = { ...activePaperKeyRef.current, search: '' };
+    setEmbeddedPdf((prev) => ({ ...prev, search: null }));
+    setSnapshots((prev) => ({ ...prev, search: null }));
+    setActivePaper((prev) => ({ ...prev, search: null }));
     setIsSearching(true);
     setStatusText(showSearchLimit ? '正在搜索论文…' : '正在打开论文…');
     try {
       const result = await window.deepxiv.search({ query, limit: Number(searchLimit), mode: searchMode, source_scope: searchSourceScope });
       const papers = dedupePapers(sortPapersByTime((result.results || []).map(normalizePaper)));
       setSearchResults(papers);
-      if (papers[0]) {
-        await openPaper('search', papers[0]);
-      } else {
+      if (!papers[0]) {
+        activePaperKeyRef.current = { ...activePaperKeyRef.current, search: '' };
+        setEmbeddedPdf((prev) => ({ ...prev, search: null }));
         setSnapshots((prev) => ({ ...prev, search: null }));
         setActivePaper((prev) => ({ ...prev, search: null }));
       }
       setStatusText('');
     } catch (error) {
+      activePaperKeyRef.current = { ...activePaperKeyRef.current, search: '' };
       setSearchResults([]);
+      setEmbeddedPdf((prev) => ({ ...prev, search: null }));
       setSnapshots((prev) => ({ ...prev, search: null }));
       setActivePaper((prev) => ({ ...prev, search: null }));
       setStatusText(toUserErrorMessage(error, '搜索失败'));
@@ -1567,8 +1912,18 @@ export default function App() {
   }
 
   function closeEmbeddedPdf(context) {
+    bumpContextRequest(pdfOpenRequestRef, context);
     updateEmbeddedPdfViewer(context, null);
   }
+
+  const handlePdfViewerStateChange = useCallback((context, rawState) => {
+    const normalized = normalizePdfViewerState(rawState);
+    if (!normalized.paperKey) return;
+    if (activePaperKeyRef.current[context] && activePaperKeyRef.current[context] !== normalized.paperKey) {
+      return;
+    }
+    mergePdfViewerState(normalized);
+  }, [mergePdfViewerState]);
 
   async function handleAskAI(payload) {
     setStatusText('AI 正在结合论文上下文思考…');
@@ -1586,6 +1941,8 @@ export default function App() {
     setFavorites((result.favorites || []).map(normalizePaper));
     setFavoriteGroups(result.favoriteGroups || favoriteGroups);
     if (getFavoriteKey(activePaper.library) === paperId) {
+      activePaperKeyRef.current = { ...activePaperKeyRef.current, library: '' };
+      setEmbeddedPdf((prev) => ({ ...prev, library: null }));
       setActivePaper((prev) => ({ ...prev, library: null }));
       setSnapshots((prev) => ({ ...prev, library: null }));
     }
@@ -1605,21 +1962,62 @@ export default function App() {
       setStatusText('当前论文暂未提供可打开的 PDF');
       return;
     }
+    const paperKey = getPaperSessionKey(snapshot, paper);
+    const requestId = bumpContextRequest(pdfOpenRequestRef, context);
+    const readyStatus = getPdfStatus(snapshot, paper);
     try {
-      const resolved = await resolvePdfOpenForPaper(snapshot, paper);
+      mergePdfViewerState({
+        paperKey,
+        state: 'loading',
+        message: '正在打开 PDF…',
+      });
+      const resolved = readyStatus?.state === 'ready' ? readyStatus : await resolvePdfOpenForPaper(snapshot, paper);
+      if (!isLatestContextRequest(pdfOpenRequestRef, context, requestId)) return;
+      if (activePaperKeyRef.current[context] && activePaperKeyRef.current[context] !== paperKey) return;
+      if (resolved?.state !== 'ready') {
+        mergePdfViewerState({
+          paperKey,
+          state: 'error',
+          error: resolved?.message || '当前论文暂未提供可打开的 PDF',
+          message: resolved?.message || '当前论文暂未提供可打开的 PDF',
+        });
+        setStatusText(toUserErrorMessage({ message: resolved?.message || '当前论文暂未提供可打开的 PDF' }, '打开 PDF 失败'));
+        return;
+      }
+      const openTarget = resolved?.cachedPath || resolved?.openTarget || payload.local_pdf_path || payload.target;
+      if (!openTarget) {
+        mergePdfViewerState({
+          paperKey,
+          state: 'error',
+          error: '当前论文暂未提供可打开的 PDF',
+          message: '当前论文暂未提供可打开的 PDF',
+        });
+        setStatusText('当前论文暂未提供可打开的 PDF');
+        return;
+      }
+      const viewerPayload = {
+        ...payload,
+        target: openTarget,
+        local_pdf_path: resolved?.cachedPath || payload.local_pdf_path,
+        pdf_url: resolved?.sourceUrl || payload.pdf_url,
+      };
       updateEmbeddedPdfViewer(context, {
-        target: resolved?.openTarget || payload.target,
+        target: openTarget,
         title: snapshot?.brief?.title || snapshot?.head?.title || paper?.title || '论文 PDF',
-        paperKey: getPaperSessionKey(snapshot, paper),
-        payload: {
-          ...payload,
-          target: resolved?.openTarget || payload.target,
-          local_pdf_path: resolved?.cachedPath || payload.local_pdf_path,
-          pdf_url: resolved?.sourceUrl || payload.pdf_url,
-        },
+        paperKey,
+        requestId,
+        payload: viewerPayload,
       });
       setStatusText('');
     } catch (error) {
+      if (!isLatestContextRequest(pdfOpenRequestRef, context, requestId)) return;
+      if (activePaperKeyRef.current[context] && activePaperKeyRef.current[context] !== paperKey) return;
+      mergePdfViewerState({
+        paperKey,
+        state: 'error',
+        error: toUserErrorMessage(error, '打开 PDF 失败'),
+        message: toUserErrorMessage(error, '打开 PDF 失败'),
+      });
       setStatusText(toUserErrorMessage(error, '打开 PDF 失败'));
     }
   }
@@ -1627,6 +2025,18 @@ export default function App() {
   const loadEmbeddedPdfDocument = useCallback(async (payload) => {
     return window.deepxiv.loadPdfDocument(payload);
   }, []);
+
+  const handleSearchPdfViewerStateChange = useCallback((state) => {
+    handlePdfViewerStateChange('search', state);
+  }, [handlePdfViewerStateChange]);
+
+  const handleLibraryPdfViewerStateChange = useCallback((state) => {
+    handlePdfViewerStateChange('library', state);
+  }, [handlePdfViewerStateChange]);
+
+  const handleHistoryPdfViewerStateChange = useCallback((state) => {
+    handlePdfViewerStateChange('history', state);
+  }, [handlePdfViewerStateChange]);
 
   const tokenStatusLabel = token?.has_token ? '已就绪' : '未配置';
   const tokenStatusHint = token?.has_token ? (token?.daily_limit ? `每日额度 ${token.daily_limit}` : '可立即搜索与阅读') : '启动时会自动匿名注册，也可在此重新连接';
@@ -1638,6 +2048,16 @@ export default function App() {
     : (aiConfigStatus?.message || '请先填写 OPENAI_API_KEY');
   const aiIndicator = aiConfigStatus?.ok ? '✓' : '✕';
   const aiIndicatorClass = aiConfigStatus?.ok ? 'success' : 'error';
+
+  function bumpContextRequest(ref, context) {
+    const next = (ref.current[context] || 0) + 1;
+    ref.current = { ...ref.current, [context]: next };
+    return next;
+  }
+
+  function isLatestContextRequest(ref, context, requestId) {
+    return ref.current[context] === requestId;
+  }
   const liveStatusText = statusText || (
     page === 'search'
       ? `${selectedSearchSource.label} · ${showSearchLimit ? `最多 ${searchLimit} 条结果` : '直接打开目标'}`
@@ -1801,7 +2221,9 @@ export default function App() {
                   aiMessages={getAiConversationMessages(snapshots.search, activePaper.search)}
                   onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.search, activePaper.search, messages)}
                   pdfStatus={getPdfStatus(snapshots.search, activePaper.search)}
+                  pdfViewerState={getPdfViewerState(snapshots.search, activePaper.search)}
                   onLoadPdfDocument={loadEmbeddedPdfDocument}
+                  onPdfViewerStateChange={handleSearchPdfViewerStateChange}
                 />
               </div>
             </div>
@@ -1926,7 +2348,9 @@ export default function App() {
                   aiMessages={getAiConversationMessages(snapshots.library, activePaper.library)}
                   onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.library, activePaper.library, messages)}
                   pdfStatus={getPdfStatus(snapshots.library, activePaper.library)}
+                  pdfViewerState={getPdfViewerState(snapshots.library, activePaper.library)}
                   onLoadPdfDocument={loadEmbeddedPdfDocument}
+                  onPdfViewerStateChange={handleLibraryPdfViewerStateChange}
                 />
               </div>
             </div>
@@ -1956,7 +2380,9 @@ export default function App() {
                   aiMessages={getAiConversationMessages(snapshots.history, activePaper.history)}
                   onAiMessagesChange={(messages) => setAiConversationMessages(snapshots.history, activePaper.history, messages)}
                   pdfStatus={getPdfStatus(snapshots.history, activePaper.history)}
+                  pdfViewerState={getPdfViewerState(snapshots.history, activePaper.history)}
                   onLoadPdfDocument={loadEmbeddedPdfDocument}
+                  onPdfViewerStateChange={handleHistoryPdfViewerStateChange}
                 />
               </div>
             </div>

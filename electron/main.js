@@ -1,9 +1,10 @@
-const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, protocol } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const { execFile, spawn } = require('child_process');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 const { pathToFileURL } = require('url');
 
 const DEFAULT_AI_CONFIG = {
@@ -25,7 +26,48 @@ let mainWindow = null;
 const pdfViewerWindows = new Set();
 const pdfPrefetchTasks = new Map();
 const pdfPrefetchStatuses = new Map();
+const pdfDocumentSessions = new Map();
 const PDF_CACHE_NAMESPACE = 'v1';
+const PDF_FETCH_TIMEOUT_MS = 90000;
+const PDF_LANDING_FETCH_TIMEOUT_MS = 45000;
+const PDF_HTML_PREVIEW_LIMIT_BYTES = 768 * 1024;
+const PDF_RESOLVER_MAX_CANDIDATES = 18;
+const PDF_RESOLVER_PARALLELISM = 3;
+const PDF_BROWSER_RESOLUTION_TIMEOUT_MS = 25000;
+const PDF_BROWSER_RESOLUTION_POLL_MS = 1200;
+const PDF_SIBLING_SEARCH_LIMIT = 12;
+const PDF_SIBLING_MAX_ATTEMPTS = 3;
+const PDF_DOCUMENT_PROTOCOL = 'deepxiv-pdf';
+let pdfDocumentProtocolRegistered = false;
+const RESTRICTED_DIRECT_PDF_HOSTS = new Set(['dl.acm.org', 'www.gbv.de', 'pubs.acs.org']);
+const WEAK_PDF_SOURCE_HOSTS = new Set([
+  'www.researchgate.net',
+  'researchgate.net',
+  'academia.edu',
+  'www.academia.edu',
+]);
+const BROWSER_ASSISTED_PDF_HOSTS = new Set([
+  'onlinelibrary.wiley.com',
+  'www.onlinelibrary.wiley.com',
+  'ieeexplore.ieee.org',
+  'dl.acm.org',
+  'pubs.acs.org',
+  'link.springer.com',
+  'www.sciencedirect.com',
+]);
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: PDF_DOCUMENT_PROTOCOL,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+]);
 
 function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
   if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
@@ -211,9 +253,14 @@ function looksLikePdfUrl(url) {
   return (
     value.includes('.pdf')
     || value.includes('/pdf/')
+    || value.includes('/pdfdirect/')
+    || value.includes('/epdf/')
     || value.includes('arxiv.org/pdf/')
     || value.includes('/download/')
-    || /[?&](download=1|download=true|format=pdf|type=pdf)\b/.test(value)
+    || value.includes('downloadpdf')
+    || value.includes('articlepdf')
+    || value.includes('fullpdf')
+    || /[?&](download=1|download=true|format=pdf|type=pdf|pdf=1)\b/.test(value)
   );
 }
 
@@ -223,6 +270,160 @@ function isRemoteHttpUrl(url) {
 
 function sha1(value) {
   return crypto.createHash('sha1').update(String(value || '')).digest('hex');
+}
+
+function prunePdfDocumentSessions(maxSize = 256) {
+  if (pdfDocumentSessions.size <= maxSize) {
+    return;
+  }
+  const entries = [...pdfDocumentSessions.entries()].sort((left, right) => Number(left[1]?.updatedAt || 0) - Number(right[1]?.updatedAt || 0));
+  for (const [token] of entries.slice(0, Math.max(0, entries.length - maxSize))) {
+    pdfDocumentSessions.delete(token);
+  }
+}
+
+function rememberPdfDocument(filePath, paperKey = '') {
+  const normalizedPath = String(filePath || '').trim();
+  if (!normalizedPath) {
+    return '';
+  }
+  const token = sha1(`${paperKey}|${normalizedPath}`);
+  pdfDocumentSessions.set(token, {
+    filePath: normalizedPath,
+    updatedAt: Date.now(),
+  });
+  prunePdfDocumentSessions();
+  return token;
+}
+
+function buildPdfDocumentUrl(filePath, paperKey = '') {
+  const token = rememberPdfDocument(filePath, paperKey);
+  if (!token) {
+    return '';
+  }
+  const filename = encodeURIComponent(path.basename(filePath || '') || 'document.pdf');
+  return `${PDF_DOCUMENT_PROTOCOL}://document/${token}/${filename}`;
+}
+
+function requestHeaderValue(request, headerName) {
+  if (request?.headers?.get) {
+    return String(request.headers.get(headerName) || '').trim();
+  }
+  const headers = request?.headers || {};
+  return String(headers[headerName] || headers[String(headerName || '').toLowerCase()] || '').trim();
+}
+
+function parsePdfByteRange(rangeHeader, totalSize) {
+  const value = String(rangeHeader || '').trim();
+  if (!value || !Number.isFinite(totalSize) || totalSize <= 0) {
+    return null;
+  }
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(value);
+  if (!match) {
+    return null;
+  }
+  const startRaw = match[1];
+  const endRaw = match[2];
+
+  let start = startRaw === '' ? NaN : Number(startRaw);
+  let end = endRaw === '' ? NaN : Number(endRaw);
+
+  if (Number.isNaN(start) && Number.isNaN(end)) {
+    return null;
+  }
+
+  if (Number.isNaN(start)) {
+    const suffixLength = Number(endRaw);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+      return null;
+    }
+    start = Math.max(0, totalSize - suffixLength);
+    end = totalSize - 1;
+  } else {
+    if (!Number.isFinite(start) || start < 0 || start >= totalSize) {
+      return null;
+    }
+    if (Number.isNaN(end) || end >= totalSize) {
+      end = totalSize - 1;
+    }
+  }
+
+  if (!Number.isFinite(end) || end < start) {
+    return null;
+  }
+
+  return {
+    start,
+    end,
+    length: (end - start) + 1,
+  };
+}
+
+function textResponse(message, status = 400) {
+  return new Response(String(message || ''), {
+    status,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+    },
+  });
+}
+
+async function createPdfProtocolResponse(filePath, request) {
+  const stats = await fsp.stat(filePath);
+  if (!stats.isFile() || stats.size < 4) {
+    return textResponse('PDF 文件不存在', 404);
+  }
+
+  const headers = new Headers({
+    'content-type': 'application/pdf',
+    'accept-ranges': 'bytes',
+    'cache-control': 'no-store',
+  });
+  const range = parsePdfByteRange(requestHeaderValue(request, 'range'), stats.size);
+
+  if (range) {
+    headers.set('content-length', String(range.length));
+    headers.set('content-range', `bytes ${range.start}-${range.end}/${stats.size}`);
+    return new Response(
+      Readable.toWeb(fs.createReadStream(filePath, { start: range.start, end: range.end })),
+      {
+        status: 206,
+        headers,
+      }
+    );
+  }
+
+  headers.set('content-length', String(stats.size));
+  return new Response(Readable.toWeb(fs.createReadStream(filePath)), {
+    status: 200,
+    headers,
+  });
+}
+
+function registerPdfDocumentProtocol() {
+  if (pdfDocumentProtocolRegistered) {
+    return;
+  }
+  protocol.handle(PDF_DOCUMENT_PROTOCOL, async (request) => {
+    try {
+      const url = new URL(request.url);
+      const [token] = url.pathname.split('/').filter(Boolean);
+      const filePath = String(pdfDocumentSessions.get(token)?.filePath || '').trim();
+      if (!filePath) {
+        return textResponse('PDF 会话不存在', 404);
+      }
+      const valid = await validatePdfFilePath(filePath);
+      if (!valid) {
+        pdfDocumentSessions.delete(token);
+        return textResponse('PDF 文件无效', 410);
+      }
+      return createPdfProtocolResponse(filePath, request);
+    } catch (error) {
+      return textResponse(String(error?.message || error || 'PDF 协议处理失败').trim(), 500);
+    }
+  });
+  pdfDocumentProtocolRegistered = true;
 }
 
 function favoriteKeyFromPaper(paper = {}) {
@@ -276,6 +477,84 @@ function pdfCacheDir() {
   return path.join(app.getPath('userData'), 'pdf-cache', PDF_CACHE_NAMESPACE);
 }
 
+function pdfCandidateKindFromUrl(url, fallbackKind = 'direct_pdf') {
+  const value = String(url || '').trim();
+  if (!value) return fallbackKind;
+  return looksLikePdfUrl(value) ? 'direct_pdf' : fallbackKind;
+}
+
+function normalizePdfCandidate(rawCandidate = {}, fallbackKind = 'direct_pdf') {
+  if (typeof rawCandidate === 'string') {
+    const url = String(rawCandidate || '').trim();
+    if (!isRemoteHttpUrl(url)) return null;
+    return {
+      url,
+      kind: pdfCandidateKindFromUrl(url, fallbackKind),
+      source: '',
+      label: '',
+      host: (() => {
+        try {
+          return new URL(url).host.toLowerCase();
+        } catch (error) {
+          return '';
+        }
+      })(),
+      version: '',
+      license: '',
+      isOa: false,
+    };
+  }
+  const url = String(rawCandidate?.url || '').trim();
+  if (!isRemoteHttpUrl(url)) return null;
+  const kind = String(rawCandidate?.kind || '').trim().toLowerCase() || pdfCandidateKindFromUrl(url, fallbackKind);
+  return {
+    url,
+    kind,
+    source: String(rawCandidate?.source || '').trim(),
+    label: String(rawCandidate?.label || '').trim(),
+    host: String(rawCandidate?.host || (() => {
+      try {
+        return new URL(url).host.toLowerCase();
+      } catch (error) {
+        return '';
+      }
+    })()).trim().toLowerCase(),
+    version: String(rawCandidate?.version || '').trim(),
+    license: String(rawCandidate?.license || '').trim(),
+    isOa: rawCandidate?.is_oa === true || rawCandidate?.isOa === true,
+  };
+}
+
+function normalizePdfCandidates(rawCandidates = [], fallbackKind = 'direct_pdf') {
+  if (!Array.isArray(rawCandidates)) {
+    return [];
+  }
+  const seen = new Set();
+  const result = [];
+  for (const rawCandidate of rawCandidates) {
+    const candidate = normalizePdfCandidate(rawCandidate, fallbackKind);
+    if (!candidate?.url) continue;
+    const key = `${candidate.kind}:${candidate.url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+  return result;
+}
+
+function addUniquePdfCandidate(list, seen, rawCandidate, fallbackKind = 'direct_pdf', extra = {}) {
+  const candidate = normalizePdfCandidate({ ...(rawCandidate || {}), ...extra }, fallbackKind);
+  if (!candidate?.url) {
+    return;
+  }
+  const key = `${candidate.kind}:${candidate.url}`;
+  if (seen.has(key)) {
+    return;
+  }
+  seen.add(key);
+  list.push(candidate);
+}
+
 function normalizePdfPayload(payload = {}) {
   const target = String(payload.target || payload.local_pdf_path || payload.pdf_url || '').trim();
   const targetKind = String(payload.target_kind || (isRemoteHttpUrl(target) ? 'url' : 'path')).trim().toLowerCase() || 'path';
@@ -285,27 +564,147 @@ function normalizePdfPayload(payload = {}) {
     || payload.paper_key
     || (target ? `pdf:${sha1(target)}` : '')
   ).trim();
-  const sourceUrl = isRemoteHttpUrl(target)
-    ? target
-    : (isRemoteHttpUrl(payload.pdf_url) ? String(payload.pdf_url).trim() : '');
+  const explicitPdfUrl = String(payload.pdf_url || '').trim();
+  const sourceUrl = isRemoteHttpUrl(explicitPdfUrl)
+    ? explicitPdfUrl
+    : (isRemoteHttpUrl(target) ? target : '');
+  const externalUrl = String(payload.external_url || '').trim();
   const localPath = !isRemoteHttpUrl(target) ? target : String(payload.local_pdf_path || '').trim();
-  const cachePath = sourceUrl ? path.join(pdfCacheDir(), `${sha1(`${paperKey}|${sourceUrl}`)}.pdf`) : '';
+  const cacheSeed = sourceUrl || externalUrl || localPath || target;
+  const cachePath = cacheSeed ? path.join(pdfCacheDir(), `${sha1(`${paperKey}|${cacheSeed}`)}.pdf`) : '';
   return {
     ...payload,
     paperKey,
     title: String(payload.title || '论文 PDF').trim() || '论文 PDF',
+    authorLine: String(payload.author_line || payload.authorLine || '').trim(),
+    publishAt: String(payload.publish_at || payload.publishAt || '').trim(),
+    doi: String(payload.doi || '').trim(),
     sourceKind: String(payload.source_kind || '').trim().toLowerCase(),
+    sourceLabel: String(payload.source_label || '').trim(),
     target,
     targetKind,
     sourceUrl,
+    externalUrl,
     localPath,
     cachePath,
     pmcid: String(payload.pmcid || '').trim().toUpperCase(),
+    reasonCode: String(payload.pdf_reason_code || payload.reasonCode || '').trim(),
+    reasonMessage: String(payload.pdf_reason_message || payload.reasonMessage || '').trim(),
+    arxivId: String(payload.arxiv_id || '').trim(),
+    openalexId: String(payload.openalex_id || '').trim(),
+    explicitArxivId: payload.explicit_arxiv_id === true,
+    pdfCandidates: normalizePdfCandidates(payload.pdf_candidates || [], 'landing_page'),
+    openalexContentUrl: String(payload.openalex_content_url || '').trim(),
+    openalexOaUrl: String(payload.openalex_oa_url || '').trim(),
+    openalexOaStatus: String(payload.openalex_oa_status || '').trim(),
+    openalexIsOa: payload.openalex_is_oa === true,
+    openalexHasContentPdf: payload.openalex_has_content_pdf === true,
+    disableSiblingFallback: payload.disable_sibling_fallback === true || payload.disableSiblingFallback === true,
+    resolvedFromSibling: payload.resolved_from_sibling === true || payload.resolvedFromSibling === true,
+    resolvedFromPaperKey: String(payload.resolved_from_paper_key || payload.resolvedFromPaperKey || '').trim(),
+    resolvedSourceKind: String(payload.resolved_source_kind || payload.resolvedSourceKind || '').trim(),
+    resolvedSourceLabel: String(payload.resolved_source_label || payload.resolvedSourceLabel || '').trim(),
+    resolvedMatchReason: String(payload.resolved_match_reason || payload.resolvedMatchReason || '').trim(),
+    resolvedPaperTitle: String(payload.resolved_paper_title || payload.resolvedPaperTitle || '').trim(),
   };
 }
 
 function clonePdfStatus(status) {
   return status ? JSON.parse(JSON.stringify(status)) : null;
+}
+
+function defaultPdfReasonMessage(normalized) {
+  const code = String(normalized?.reasonCode || '').trim();
+  if (normalized?.localPath) {
+    return '本地 PDF 已就绪';
+  }
+  switch (code) {
+    case 'ready_remote':
+      return '已发现可缓存 PDF';
+    case 'ready_local':
+      return '本地 PDF 已就绪';
+    case 'needs_pmc_resolution':
+      return '正在准备 PDF…可稍后打开';
+    case 'needs_browser_resolution':
+      return '正在浏览器验证…';
+    case 'browser_verified_no_pdf':
+      return '浏览器验证后未发现可下载 PDF';
+    case 'source_paywalled':
+      return '源站存在权限限制';
+    case 'source_restricted':
+      return '源站限制 PDF 直连';
+    case 'landing_page_only':
+      return '源站仅提供论文落地页，未发现可用 PDF';
+    case 'no_open_access_pdf':
+      return '源站未提供可用 PDF';
+    case 'invalid_arxiv_fallback':
+      return '当前记录未提供有效 arXiv PDF';
+    case 'source_timeout':
+      return 'PDF 缓存超时';
+    case 'cache_failed':
+      return 'PDF 缓存失败';
+    default:
+      return normalized?.reasonMessage || (normalized?.target ? '当前论文没有可缓存的 PDF 直链' : '未找到可用 PDF');
+  }
+}
+
+function resolvedPdfStatusFields(raw = {}) {
+  return {
+    resolvedFromSibling: raw?.resolvedFromSibling === true,
+    resolvedFromPaperKey: String(raw?.resolvedFromPaperKey || '').trim(),
+    resolvedSourceKind: String(raw?.resolvedSourceKind || '').trim(),
+    resolvedSourceLabel: String(raw?.resolvedSourceLabel || '').trim(),
+    resolvedMatchReason: String(raw?.resolvedMatchReason || '').trim(),
+    resolvedPaperTitle: String(raw?.resolvedPaperTitle || '').trim(),
+  };
+}
+
+function formatResolvedPdfReadyMessage(baseMessage, raw = {}) {
+  const resolved = resolvedPdfStatusFields(raw);
+  if (!resolved.resolvedFromSibling) {
+    return baseMessage;
+  }
+  const label = resolved.resolvedSourceLabel || resolved.resolvedSourceKind || '开放兄弟版本';
+  return `${baseMessage} · 已自动切换到开放兄弟版本（${label}）`;
+}
+
+function createPdfPrefetchStatus(normalized, overrides = {}) {
+  return {
+    paperKey: normalized?.paperKey || '',
+    title: normalized?.title || '论文 PDF',
+    state: 'missing',
+    progress: 0,
+    target: normalized?.target || '',
+    sourceUrl: normalized?.sourceUrl || '',
+    cachedPath: '',
+    openTarget: normalized?.localPath || normalized?.target || '',
+    message: defaultPdfReasonMessage(normalized),
+    reasonCode: normalized?.reasonCode || '',
+    isCached: false,
+    isLocal: Boolean(normalized?.localPath),
+    error: '',
+    ...resolvedPdfStatusFields(normalized),
+    ...overrides,
+  };
+}
+
+function pdfPrefetchTaskSignature(normalized) {
+  return sha1(JSON.stringify({
+    paperKey: normalized?.paperKey || '',
+    title: normalized?.title || '',
+    authorLine: normalized?.authorLine || '',
+    publishAt: normalized?.publishAt || '',
+    doi: normalized?.doi || '',
+    target: normalized?.target || '',
+    sourceUrl: normalized?.sourceUrl || '',
+    externalUrl: normalized?.externalUrl || '',
+    localPath: normalized?.localPath || '',
+    cachePath: normalized?.cachePath || '',
+    pmcid: normalized?.pmcid || '',
+    reasonCode: normalized?.reasonCode || '',
+    pdfCandidates: normalized?.pdfCandidates || [],
+    disableSiblingFallback: normalized?.disableSiblingFallback === true,
+  }));
 }
 
 function emitPdfPrefetchStatus(status) {
@@ -329,14 +728,29 @@ async function fileExists(filePath) {
   }
 }
 
+async function readPdfFileHeader(filePath, byteLength = 8) {
+  const handle = await fsp.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(Math.max(4, byteLength));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 async function validatePdfFilePath(filePath) {
   const target = String(filePath || '').trim();
   if (!target) {
     return false;
   }
   try {
-    await callBridge('validate-pdf-file', { path: target });
-    return true;
+    const stats = await fsp.stat(target);
+    if (!stats.isFile() || stats.size < 4) {
+      return false;
+    }
+    const header = await readPdfFileHeader(target, 8);
+    return header.length >= 4 && header.subarray(0, 4).toString('latin1') === '%PDF';
   } catch (error) {
     return false;
   }
@@ -348,17 +762,23 @@ async function getCachedPdfStatus(normalized) {
   }
   if (normalized.localPath) {
     if (!(await fileExists(normalized.localPath))) {
-      return emitPdfPrefetchStatus({
-        paperKey: normalized.paperKey,
-        title: normalized.title,
+      return emitPdfPrefetchStatus(createPdfPrefetchStatus(normalized, {
         state: 'error',
-        progress: 0,
-        target: normalized.target,
-        sourceUrl: '',
-        cachedPath: '',
-        openTarget: '',
         message: '本地 PDF 文件不存在',
-      });
+        error: '本地 PDF 文件不存在',
+        openTarget: '',
+        reasonCode: 'cache_failed',
+      }));
+    }
+    const valid = await validatePdfFilePath(normalized.localPath);
+    if (!valid) {
+      return emitPdfPrefetchStatus(createPdfPrefetchStatus(normalized, {
+        state: 'error',
+        message: '本地 PDF 文件无效',
+        error: '本地 PDF 文件无效',
+        openTarget: '',
+        reasonCode: 'cache_failed',
+      }));
     }
     return emitPdfPrefetchStatus({
       paperKey: normalized.paperKey,
@@ -369,12 +789,15 @@ async function getCachedPdfStatus(normalized) {
       sourceUrl: '',
       cachedPath: normalized.localPath,
       openTarget: normalized.localPath,
-      message: '本地 PDF 已就绪',
+      message: formatResolvedPdfReadyMessage('本地 PDF 已就绪', normalized),
+      reasonCode: 'ready_local',
       isLocal: true,
       isCached: true,
+      ...resolvedPdfStatusFields(normalized),
     });
   }
   if (normalized.cachePath && await fileExists(normalized.cachePath)) {
+    const previousStatus = clonePdfStatus(pdfPrefetchStatuses.get(normalized.paperKey) || null);
     const valid = await validatePdfFilePath(normalized.cachePath);
     if (!valid) {
       await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
@@ -387,21 +810,19 @@ async function getCachedPdfStatus(normalized) {
       state: 'ready',
       progress: 1,
       target: normalized.target,
-      sourceUrl: normalized.sourceUrl,
+      sourceUrl: previousStatus?.sourceUrl || normalized.sourceUrl || normalized.externalUrl,
       cachedPath: normalized.cachePath,
       openTarget: normalized.cachePath,
-      message: 'PDF 已缓存',
+      message: formatResolvedPdfReadyMessage('PDF 已缓存', previousStatus || normalized),
+      reasonCode: 'ready_remote',
       isCached: true,
+      ...resolvedPdfStatusFields(previousStatus || normalized),
     });
   }
   return clonePdfStatus(pdfPrefetchStatuses.get(normalized.paperKey) || null);
 }
 
 function validatePdfSignature(firstChunk, response, normalized) {
-  const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
-  if (contentType.includes('pdf')) {
-    return true;
-  }
   const buffer = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk || []);
   if (buffer.length >= 4 && buffer.subarray(0, 4).toString('latin1') === '%PDF') {
     return true;
@@ -409,18 +830,1117 @@ function validatePdfSignature(firstChunk, response, normalized) {
   return false;
 }
 
+function isKnownRestrictedPdfHost(url) {
+  try {
+    const host = new URL(String(url || '').trim()).host.toLowerCase();
+    return RESTRICTED_DIRECT_PDF_HOSTS.has(host);
+  } catch (error) {
+    return false;
+  }
+}
+
+function decodePdfResponsePreview(firstChunk, byteLimit = 512) {
+  const buffer = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk || []);
+  if (!buffer.length) return '';
+  return buffer.subarray(0, Math.min(buffer.length, byteLimit)).toString('utf8').trim().toLowerCase();
+}
+
+function isLikelyHtmlLikeResponse(contentType, previewText) {
+  const type = String(contentType || '').toLowerCase();
+  if (/(text\/html|application\/xhtml\+xml|text\/plain|application\/xml|text\/xml|application\/json)/.test(type)) {
+    return true;
+  }
+  return previewText.startsWith('<!doctype html') || previewText.startsWith('<html') || previewText.startsWith('<?xml') || previewText.startsWith('{');
+}
+
+function classifyInvalidPdfResponse(firstChunk, response, normalized, candidate = {}) {
+  const contentType = String(response?.headers?.get?.('content-type') || '').toLowerCase();
+  const finalUrl = String(response?.url || candidate?.url || normalized?.sourceUrl || normalized?.externalUrl || normalized?.target || '').trim();
+  const previewText = decodePdfResponsePreview(firstChunk);
+  const cfMitigated = String(response?.headers?.get?.('cf-mitigated') || '').trim().toLowerCase();
+  const host = hostFromUrl(finalUrl);
+  if (Number(response?.status || 0) === 401 || Number(response?.status || 0) === 403) {
+    return {
+      message: '源站限制 PDF 直连',
+      reasonCode: 'source_restricted',
+      finalUrl,
+      previewText,
+      canParseLandingPage: true,
+      needsBrowserVerification: cfMitigated === 'challenge' || BROWSER_ASSISTED_PDF_HOSTS.has(host),
+    };
+  }
+  if (isLikelyHtmlLikeResponse(contentType, previewText)) {
+    return {
+      message: isKnownRestrictedPdfHost(finalUrl) ? '源站限制 PDF 直连' : '源站仅提供论文落地页',
+      reasonCode: isKnownRestrictedPdfHost(finalUrl) ? 'source_restricted' : 'landing_page_only',
+      finalUrl,
+      previewText,
+      canParseLandingPage: true,
+      needsBrowserVerification: cfMitigated === 'challenge' || BROWSER_ASSISTED_PDF_HOSTS.has(host),
+    };
+  }
+  if (isKnownRestrictedPdfHost(finalUrl)) {
+    return {
+      message: '源站限制 PDF 直连',
+      reasonCode: 'source_restricted',
+      finalUrl,
+      previewText,
+      canParseLandingPage: true,
+      needsBrowserVerification: true,
+    };
+  }
+  return {
+    message: '返回内容不是 PDF 文件',
+    reasonCode: 'cache_failed',
+    finalUrl,
+    previewText,
+    canParseLandingPage: false,
+    needsBrowserVerification: false,
+  };
+}
+
 function isPmcOaCandidate(normalized) {
   const sourceKind = String(normalized?.sourceKind || normalized?.source_kind || '').trim().toLowerCase();
   return Boolean(normalized?.pmcid && ['pubmed', 'pmc', 'preprint', 'europepmc'].includes(sourceKind));
 }
 
+function decodeHtmlEntitiesLite(value) {
+  return String(value || '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&#x27;/gi, "'")
+    .replace(/&#x2f;|&#47;/gi, '/')
+    .replace(/&#x3a;|&#58;/gi, ':')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\\\//g, '/');
+}
+
+function resolveCandidateUrl(url, baseUrl) {
+  const raw = decodeHtmlEntitiesLite(String(url || '').trim());
+  if (!raw) return '';
+  try {
+    return new URL(raw, baseUrl).toString();
+  } catch (error) {
+    return '';
+  }
+}
+
+function enqueuePdfCandidate(queue, seen, rawCandidate, fallbackKind = 'direct_pdf', extra = {}, { front = false } = {}) {
+  const candidate = normalizePdfCandidate({ ...(rawCandidate || {}), ...extra }, fallbackKind);
+  if (!candidate?.url) return;
+  const key = `${candidate.kind}:${candidate.url}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  if (front) {
+    queue.unshift(candidate);
+  } else {
+    queue.push(candidate);
+  }
+}
+
+function pdfCandidatePriority(candidate) {
+  const url = String(candidate?.url || '').trim().toLowerCase();
+  const host = hostFromUrl(url);
+  const source = String(candidate?.source || '').trim().toLowerCase();
+  let score = 100;
+
+  if (candidate?.kind === 'direct_pdf') score -= 20;
+  if (candidate?.kind === 'content_api') score += 35;
+  if (source.includes('arxiv')) score -= 50;
+  if (source.includes('pmc')) score -= 45;
+  if (source.includes('open_access')) score -= 35;
+  if (host === 'arxiv.org') score -= 40;
+  if (host.endsWith('ncbi.nlm.nih.gov')) score -= 35;
+  if (host.endsWith('europepmc.org')) score -= 25;
+  if (BROWSER_ASSISTED_PDF_HOSTS.has(host)) score += 20;
+  if (RESTRICTED_DIRECT_PDF_HOSTS.has(host)) score += 25;
+
+  return score;
+}
+
+function buildPdfResolverCandidates(normalized) {
+  const queue = [];
+  const seen = new Set();
+
+  for (const candidate of normalized?.pdfCandidates || []) {
+    enqueuePdfCandidate(queue, seen, candidate, candidate.kind || 'landing_page');
+  }
+
+  if (normalized?.sourceUrl) {
+    enqueuePdfCandidate(queue, seen, { url: normalized.sourceUrl }, looksLikePdfUrl(normalized.sourceUrl) ? 'direct_pdf' : 'landing_page', {
+      source: 'payload:source_url',
+      label: 'Source',
+    });
+  }
+
+  if (normalized?.externalUrl) {
+    enqueuePdfCandidate(queue, seen, { url: normalized.externalUrl }, 'landing_page', {
+      source: 'payload:external_url',
+      label: 'Landing page',
+    });
+  }
+
+  if (normalized?.openalexOaUrl) {
+    enqueuePdfCandidate(queue, seen, { url: normalized.openalexOaUrl }, looksLikePdfUrl(normalized.openalexOaUrl) ? 'direct_pdf' : 'landing_page', {
+      source: 'payload:openalex_oa',
+      label: 'Open access',
+    });
+  }
+
+  if (normalized?.openalexContentUrl) {
+    enqueuePdfCandidate(queue, seen, { url: normalized.openalexContentUrl }, 'content_api', {
+      source: 'payload:openalex_content',
+      label: 'OpenAlex Content API',
+    });
+  }
+
+  if (!queue.length && normalized?.arxivId && normalized?.explicitArxivId) {
+    enqueuePdfCandidate(queue, seen, { url: `https://arxiv.org/pdf/${normalized.arxivId}.pdf` }, 'direct_pdf', {
+      source: 'payload:arxiv_fallback',
+      label: 'arXiv',
+    });
+    enqueuePdfCandidate(queue, seen, { url: `https://arxiv.org/abs/${normalized.arxivId}` }, 'landing_page', {
+      source: 'payload:arxiv_abs',
+      label: 'arXiv',
+    });
+  }
+
+  return queue
+    .sort((left, right) => pdfCandidatePriority(left) - pdfCandidatePriority(right))
+    .slice(0, PDF_RESOLVER_MAX_CANDIDATES);
+}
+
+function abortPdfPrefetchControllers(taskRecord) {
+  if (taskRecord?.abortController) {
+    try {
+      taskRecord.abortController.abort();
+    } catch (error) {
+    }
+  }
+  for (const controller of taskRecord?.abortControllers || []) {
+    try {
+      controller.abort();
+    } catch (error) {
+    }
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function hostFromUrl(url) {
+  try {
+    return new URL(String(url || '').trim()).host.toLowerCase();
+  } catch (error) {
+    return '';
+  }
+}
+
+function normalizePaperTitleForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+    .replace(/\babstract reprint\b/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function titleTokenSet(value) {
+  return new Set(normalizePaperTitleForMatch(value).split(' ').filter(Boolean));
+}
+
+function titleSimilarityScore(left, right) {
+  const leftNormalized = normalizePaperTitleForMatch(left);
+  const rightNormalized = normalizePaperTitleForMatch(right);
+  if (!leftNormalized || !rightNormalized) {
+    return 0;
+  }
+  if (leftNormalized === rightNormalized) {
+    return 1;
+  }
+  if (leftNormalized.includes(rightNormalized) || rightNormalized.includes(leftNormalized)) {
+    return 0.95;
+  }
+  const leftTokens = titleTokenSet(left);
+  const rightTokens = titleTokenSet(right);
+  if (!leftTokens.size || !rightTokens.size) {
+    return 0;
+  }
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+  const union = new Set([...leftTokens, ...rightTokens]).size || 1;
+  return overlap / union;
+}
+
+function normalizeAuthorNames(authorLine) {
+  return String(authorLine || '')
+    .split(/[,;]| and /i)
+    .map((item) => item.replace(/[^\p{L}\p{N}\s.-]+/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function firstAuthorKey(authorLine) {
+  return normalizeAuthorNames(authorLine)[0] || '';
+}
+
+function authorOverlapScore(left, right) {
+  const leftAuthors = normalizeAuthorNames(left);
+  const rightAuthors = normalizeAuthorNames(right);
+  if (!leftAuthors.length || !rightAuthors.length) {
+    return 0;
+  }
+  if (leftAuthors[0] && rightAuthors[0] && leftAuthors[0] === rightAuthors[0]) {
+    return 1;
+  }
+  let overlap = 0;
+  const rightSet = new Set(rightAuthors);
+  for (const author of leftAuthors) {
+    if (rightSet.has(author)) {
+      overlap += 1;
+    }
+  }
+  return overlap / Math.max(leftAuthors.length, rightAuthors.length, 1);
+}
+
+function extractPublishYear(value) {
+  const match = String(value || '').match(/\b(19|20)\d{2}\b/);
+  return match ? Number(match[0]) : 0;
+}
+
+function isWeakPdfSourceHost(host) {
+  return WEAK_PDF_SOURCE_HOSTS.has(String(host || '').trim().toLowerCase());
+}
+
+function isTrustedRepositoryHost(host) {
+  const value = String(host || '').trim().toLowerCase();
+  if (!value) return false;
+  return (
+    value === 'arxiv.org'
+    || value.endsWith('ncbi.nlm.nih.gov')
+    || value.endsWith('europepmc.org')
+    || value.startsWith('ojs.')
+    || value.includes('diva-portal')
+    || value.includes('worktribe')
+    || value.includes('repository')
+    || value.includes('eprints')
+    || value.includes('escholarship')
+    || value.includes('zenodo')
+    || value.includes('hal.science')
+    || value.includes('ora.ox.ac.uk')
+  );
+}
+
+function siblingCandidateTrustScore(candidate = {}, paper = {}) {
+  const host = hostFromUrl(candidate.url || candidate.host || '');
+  const sourceKind = String(paper?.source_kind || '').trim().toLowerCase();
+  if (!host || isWeakPdfSourceHost(host)) {
+    return -1000;
+  }
+  let score = 0;
+  if (candidate.kind === 'direct_pdf') score += 60;
+  if (candidate.kind === 'landing_page') score -= 20;
+  if (candidate.kind === 'content_api') score -= 40;
+
+  if (sourceKind === 'arxiv' || host === 'arxiv.org') {
+    score += 320;
+  } else if (['pmc', 'pubmed', 'preprint', 'europepmc'].includes(sourceKind) || host.endsWith('ncbi.nlm.nih.gov') || host.endsWith('europepmc.org')) {
+    score += 260;
+  } else if (host.startsWith('ojs.') || /\b(proceedings|conference|journal)\b/i.test(String(candidate.label || ''))) {
+    score += 220;
+  } else if (isTrustedRepositoryHost(host)) {
+    score += 180;
+  } else if (candidate.isOa === true) {
+    score += 80;
+  }
+
+  if (BROWSER_ASSISTED_PDF_HOSTS.has(host)) score -= 40;
+  if (RESTRICTED_DIRECT_PDF_HOSTS.has(host)) score -= 50;
+  return score;
+}
+
+function buildSiblingPaperPdfCandidates(rawPaper = {}) {
+  const paper = {
+    ...rawPaper,
+    pdf_candidates: normalizePdfCandidates(rawPaper?.pdf_candidates || [], 'landing_page'),
+  };
+  const seen = new Set();
+  const candidates = [];
+  const add = (rawCandidate, fallbackKind = 'direct_pdf', extra = {}) => {
+    const candidate = normalizePdfCandidate({ ...(rawCandidate || {}), ...extra }, fallbackKind);
+    if (!candidate?.url) return;
+    const key = `${candidate.kind}:${candidate.url}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(candidate);
+  };
+
+  for (const candidate of paper.pdf_candidates || []) {
+    add(candidate, candidate.kind || 'landing_page');
+  }
+  if (paper.pdf_url) {
+    add({ url: paper.pdf_url, source: 'sibling:paper_pdf', label: paper.source_label || '' }, 'direct_pdf');
+  }
+  if (paper.openalex_oa_url) {
+    add({ url: paper.openalex_oa_url, source: 'sibling:openalex_oa', label: 'Open access' }, looksLikePdfUrl(paper.openalex_oa_url) ? 'direct_pdf' : 'landing_page');
+  }
+  if (paper.openalex_content_url) {
+    add({ url: paper.openalex_content_url, source: 'sibling:openalex_content', label: 'OpenAlex Content API' }, 'content_api');
+  }
+  if (paper.arxiv_id) {
+    add({ url: `https://arxiv.org/pdf/${paper.arxiv_id}.pdf`, source: 'sibling:arxiv_pdf', label: 'arXiv' }, 'direct_pdf');
+  }
+  if (paper.external_url || paper.src_url) {
+    add({ url: paper.external_url || paper.src_url, source: 'sibling:external', label: paper.source_label || '' }, 'landing_page');
+  }
+
+  return candidates
+    .map((candidate) => ({ ...candidate, trustScore: siblingCandidateTrustScore(candidate, paper) }))
+    .filter((candidate) => candidate.trustScore > -1000)
+    .sort((left, right) => right.trustScore - left.trustScore || pdfCandidatePriority(left) - pdfCandidatePriority(right));
+}
+
+function dedupeSiblingSearchResults(items = []) {
+  const seen = new Set();
+  const result = [];
+  for (const rawItem of items) {
+    const paperKey = String(rawItem?.paper_key || '').trim();
+    const externalUrl = String(rawItem?.external_url || rawItem?.src_url || '').trim();
+    const title = normalizePaperTitleForMatch(rawItem?.title || '');
+    const key = paperKey || externalUrl || title;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(rawItem);
+  }
+  return result;
+}
+
+function buildSiblingSearchQueries(title) {
+  const rawTitle = String(title || '').trim();
+  if (!rawTitle) return [];
+
+  const normalizedTitle = normalizePaperTitleForMatch(rawTitle);
+  const prefixTitle = rawTitle.split(':')[0]?.trim() || '';
+  const suffixTitle = rawTitle.includes(':') ? rawTitle.split(':').slice(1).join(':').trim() : '';
+
+  const seen = new Set();
+  const queries = [];
+  const add = (value) => {
+    const query = String(value || '').trim();
+    if (!query) return;
+    const key = query.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    queries.push(query);
+  };
+
+  add(rawTitle);
+  add(normalizedTitle);
+
+  if (prefixTitle && prefixTitle.length >= 4) {
+    add(prefixTitle);
+  }
+  if (suffixTitle && suffixTitle.length >= 16) {
+    add(suffixTitle);
+  }
+
+  return queries;
+}
+
+async function collectSiblingSearchResults(normalized) {
+  const queries = buildSiblingSearchQueries(normalized?.title);
+  if (!queries.length) return [];
+
+  const requestMap = new Map();
+  const addRequest = (payload) => {
+    const query = String(payload?.query || '').trim();
+    const sourceScope = String(payload?.source_scope || '').trim().toLowerCase();
+    if (!query || !sourceScope) return;
+    const key = `${sourceScope}:${query.toLowerCase()}`;
+    if (!requestMap.has(key)) {
+      requestMap.set(key, payload);
+    }
+  };
+
+  addRequest({ query: queries[0], limit: PDF_SIBLING_SEARCH_LIMIT, source_scope: 'mixed', mode: 'hybrid' });
+
+  for (const query of queries) {
+    addRequest({
+      query,
+      limit: Math.max(6, Math.floor(PDF_SIBLING_SEARCH_LIMIT / 2)),
+      source_scope: 'arxiv',
+      mode: 'hybrid',
+    });
+  }
+
+  const settled = await Promise.allSettled(
+    Array.from(requestMap.values()).map((payload) => callBridge('search', payload)),
+  );
+
+  const result = [];
+  for (const item of settled) {
+    if (item.status !== 'fulfilled') continue;
+    if (Array.isArray(item.value?.results)) {
+      result.push(...item.value.results);
+    }
+  }
+
+  return dedupeSiblingSearchResults(result);
+}
+
+function buildSiblingMatchReason(titleScore, authorScore, yearDelta) {
+  if (titleScore >= 0.999) {
+    return 'title_exact';
+  }
+  if (titleScore >= 0.9 && authorScore >= 0.99) {
+    return yearDelta <= 1 ? 'title_author_year' : 'title_author';
+  }
+  if (titleScore >= 0.9) {
+    return 'title_close';
+  }
+  return 'title_fuzzy';
+}
+
+function scoreSiblingPaper(rawPaper, normalized) {
+  const paper = rawPaper || {};
+  const currentPaperKey = String(normalized?.paperKey || '').trim();
+  const currentOpenalexId = String(normalized?.openalexId || '').trim();
+  const paperKey = String(paper.paper_key || '').trim();
+  const openalexId = String(paper.openalex_id || '').trim();
+
+  if (paperKey && currentPaperKey && paperKey === currentPaperKey) {
+    return null;
+  }
+  if (openalexId && currentOpenalexId && openalexId === currentOpenalexId) {
+    return null;
+  }
+
+  const siblingCandidates = buildSiblingPaperPdfCandidates(paper);
+  if (!siblingCandidates.length) {
+    return null;
+  }
+
+  const titleScore = titleSimilarityScore(normalized?.title, paper.title);
+  const authorScore = authorOverlapScore(normalized?.authorLine, paper.author_line);
+  const currentYear = extractPublishYear(normalized?.publishAt);
+  const paperYear = extractPublishYear(paper.publish_at);
+  const yearDelta = currentYear && paperYear ? Math.abs(currentYear - paperYear) : 0;
+
+  if (titleScore < 0.82) {
+    return null;
+  }
+  if (titleScore < 0.9 && authorScore < 0.5) {
+    return null;
+  }
+  if (currentYear && paperYear && yearDelta > 2 && titleScore < 0.95) {
+    return null;
+  }
+
+  const bestCandidate = siblingCandidates[0];
+  const overallScore = (titleScore * 1000) + (authorScore * 180) - (yearDelta * 20) + (bestCandidate?.trustScore || 0);
+
+  return {
+    paper,
+    score: overallScore,
+    titleScore,
+    authorScore,
+    yearDelta,
+    matchReason: buildSiblingMatchReason(titleScore, authorScore, yearDelta),
+    siblingCandidates,
+    bestCandidate,
+  };
+}
+
+function buildSiblingFallbackPayload(normalized, match) {
+  const bestCandidate = match?.bestCandidate || {};
+  return normalizePdfPayload({
+    paper_key: normalized?.paperKey || '',
+    favorite_key: normalized?.paperKey || '',
+    title: normalized?.title || match?.paper?.title || '论文 PDF',
+    author_line: normalized?.authorLine || match?.paper?.author_line || '',
+    publish_at: normalized?.publishAt || match?.paper?.publish_at || '',
+    doi: normalized?.doi || '',
+    source_kind: normalized?.sourceKind || match?.paper?.source_kind || '',
+    source_label: normalized?.sourceLabel || match?.paper?.source_label || '',
+    external_url: match?.paper?.external_url || match?.paper?.src_url || bestCandidate?.url || normalized?.externalUrl || '',
+    pdf_url: bestCandidate?.kind === 'direct_pdf' ? bestCandidate.url : '',
+    pdf_candidates: match?.siblingCandidates || [],
+    openalex_content_url: match?.paper?.openalex_content_url || '',
+    openalex_oa_url: match?.paper?.openalex_oa_url || '',
+    openalex_oa_status: match?.paper?.openalex_oa_status || '',
+    openalex_is_oa: match?.paper?.openalex_is_oa === true,
+    openalex_has_content_pdf: match?.paper?.openalex_has_content_pdf === true,
+    disable_sibling_fallback: true,
+    resolved_from_sibling: true,
+    resolved_from_paper_key: match?.paper?.paper_key || '',
+    resolved_source_kind: match?.paper?.source_kind || '',
+    resolved_source_label: bestCandidate?.label || match?.paper?.source_label || '',
+    resolved_match_reason: match?.matchReason || '',
+    resolved_paper_title: match?.paper?.title || '',
+  });
+}
+
+async function resolvePdfViaSiblingFallback({
+  normalized,
+  tempPath,
+  taskRecord,
+  initialStatus,
+  emitIfCurrent,
+  ensureCurrentTask,
+}) {
+  if (normalized?.disableSiblingFallback || normalized?.localPath) {
+    return null;
+  }
+  if (!String(normalized?.title || '').trim()) {
+    return null;
+  }
+
+  emitIfCurrent({
+    ...initialStatus,
+    state: 'checking',
+    progress: 0,
+    openTarget: normalized?.externalUrl || normalized?.target || '',
+    message: '正在尝试开放兄弟版本…',
+    reasonCode: normalized?.reasonCode || 'landing_page_only',
+    ...resolvedPdfStatusFields(normalized),
+  });
+
+  const matches = (await collectSiblingSearchResults(normalized))
+    .map((paper) => scoreSiblingPaper(paper, normalized))
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, PDF_SIBLING_MAX_ATTEMPTS);
+
+  const failures = [];
+  for (const match of matches) {
+    ensureCurrentTask();
+    const siblingPayload = buildSiblingFallbackPayload(normalized, match);
+    emitIfCurrent({
+      ...initialStatus,
+      state: 'checking',
+      progress: 0,
+      openTarget: match?.bestCandidate?.url || siblingPayload.externalUrl || normalized?.externalUrl || '',
+      message: `已找到开放兄弟版本，正在尝试 ${siblingPayload.resolvedSourceLabel || siblingPayload.resolvedSourceKind || '开放来源'}…`,
+      reasonCode: 'ready_remote',
+      ...resolvedPdfStatusFields(siblingPayload),
+    });
+
+    const siblingResult = await resolvePdfCandidatesInParallel({
+      normalized: siblingPayload,
+      tempPath,
+      taskRecord,
+      initialStatus: {
+        ...initialStatus,
+        ...resolvedPdfStatusFields(siblingPayload),
+      },
+      emitIfCurrent,
+      ensureCurrentTask,
+    });
+    if (siblingResult?.winner) {
+      return {
+        winner: {
+          ...siblingResult.winner,
+          ...resolvedPdfStatusFields(siblingPayload),
+        },
+      };
+    }
+    failures.push(...(siblingResult?.failures || []));
+  }
+
+  return { failures };
+}
+
+function shouldAttemptBrowserResolution(candidate, classification = null) {
+  const url = String(candidate?.url || '').trim();
+  const host = hostFromUrl(url);
+  if (!url || !isRemoteHttpUrl(url)) {
+    return false;
+  }
+  if (candidate?.kind === 'content_api') {
+    return false;
+  }
+  if (classification?.reasonCode === 'source_restricted') {
+    return BROWSER_ASSISTED_PDF_HOSTS.has(host) || candidate?.kind === 'landing_page';
+  }
+  if (classification?.needsBrowserVerification === true) {
+    return true;
+  }
+  if (candidate?.kind === 'landing_page' && BROWSER_ASSISTED_PDF_HOSTS.has(host)) {
+    return true;
+  }
+  return false;
+}
+
+function browserResolverUserAgent() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow.webContents.getUserAgent();
+  }
+  return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
+}
+
+async function sessionFetchWithFallback(ses, url, options = {}) {
+  if (ses && typeof ses.fetch === 'function') {
+    return ses.fetch(url, options);
+  }
+  return fetch(url, options);
+}
+
+async function waitForBrowserResolutionSettled(webContents, timeoutMs = PDF_BROWSER_RESOLUTION_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  let lastActivityAt = Date.now();
+
+  const markActivity = () => {
+    lastActivityAt = Date.now();
+  };
+
+  webContents.on('did-start-loading', markActivity);
+  webContents.on('did-stop-loading', markActivity);
+  webContents.on('did-navigate', markActivity);
+  webContents.on('did-redirect-navigation', markActivity);
+  webContents.on('dom-ready', markActivity);
+
+  try {
+    while ((Date.now() - startedAt) < timeoutMs) {
+      if (!webContents.isLoading() && (Date.now() - lastActivityAt) >= 900) {
+        return;
+      }
+      await delay(250);
+    }
+  } finally {
+    webContents.removeListener('did-start-loading', markActivity);
+    webContents.removeListener('did-stop-loading', markActivity);
+    webContents.removeListener('did-navigate', markActivity);
+    webContents.removeListener('did-redirect-navigation', markActivity);
+    webContents.removeListener('dom-ready', markActivity);
+  }
+}
+
+async function extractPdfCandidatesFromDom(webContents) {
+  return webContents.executeJavaScript(`
+    (() => {
+      const currentUrl = String(location.href || '');
+      const seen = new Set();
+      const candidates = [];
+      const push = (rawUrl, kind = 'direct_pdf', source = 'browser:dom') => {
+        const value = String(rawUrl || '').trim();
+        if (!value) return;
+        let absoluteUrl = '';
+        try {
+          absoluteUrl = new URL(value, currentUrl).toString();
+        } catch (error) {
+          return;
+        }
+        const key = kind + ':' + absoluteUrl;
+        if (seen.has(key)) return;
+        seen.add(key);
+        candidates.push({ url: absoluteUrl, kind, source });
+      };
+
+      const metaSelectors = [
+        'meta[name="citation_pdf_url"]',
+        'meta[property="citation_pdf_url"]',
+        'meta[name="pdf_url"]',
+        'meta[property="pdf_url"]',
+        'meta[name="wkhealth_pdf_url"]',
+        'link[rel="alternate"][type="application/pdf"]',
+      ];
+      for (const selector of metaSelectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          push(node.content || node.href || '', 'direct_pdf', 'browser:meta');
+        }
+      }
+
+      const linkNodes = Array.from(document.querySelectorAll('a[href], iframe[src], embed[src], object[data], link[href]'));
+      for (const node of linkNodes) {
+        const rawUrl = node.getAttribute('href') || node.getAttribute('src') || node.getAttribute('data') || '';
+        const text = String(node.textContent || node.getAttribute('title') || node.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const url = String(rawUrl || '').trim().toLowerCase();
+        if (!rawUrl) continue;
+        const pdfLike = url.includes('.pdf') || url.includes('/pdf/') || url.includes('/pdfdirect/') || url.includes('/epdf/') || url.includes('/download/') || url.includes('downloadpdf');
+        const textLike = /\\b(pdf|download|full text|view pdf)\\b/.test(text);
+        if (pdfLike || textLike) {
+          push(rawUrl, 'direct_pdf', 'browser:anchor');
+        }
+      }
+
+      if (/\\.pdf(?:$|[?#])|\\/pdf\\/|\\/pdfdirect\\/|\\/epdf\\//i.test(currentUrl)) {
+        push(currentUrl, 'direct_pdf', 'browser:location');
+      } else {
+        push(currentUrl, 'landing_page', 'browser:location');
+      }
+
+      const scriptTexts = Array.from(document.scripts || [])
+        .slice(0, 60)
+        .map((node) => String(node.textContent || '').slice(0, 20000))
+        .join('\\n');
+      const patterns = [
+        /"(?:citation_pdf_url|pdf_url|pdfUrl|downloadPdfUrl|download_url)"\\s*:\\s*"([^"]+)"/gi,
+        /'(?:citation_pdf_url|pdf_url|pdfUrl|downloadPdfUrl|download_url)'\\s*:\\s*'([^']+)'/gi,
+      ];
+      for (const pattern of patterns) {
+        let match;
+        while ((match = pattern.exec(scriptTexts)) !== null) {
+          push(match[1], 'direct_pdf', 'browser:script');
+        }
+      }
+
+      return {
+        url: currentUrl,
+        title: String(document.title || '').trim(),
+        contentType: String(document.contentType || '').trim(),
+        candidates,
+      };
+    })();
+  `, true);
+}
+
+async function tryBrowserResolvedPdfCandidates({
+  browserWindow,
+  normalized,
+  discoveredCandidates,
+  tempPath,
+  candidate,
+  initialStatus,
+  emitIfCurrent,
+  ensureCurrentTask,
+}) {
+  const ses = browserWindow.webContents.session;
+  for (const rawDiscoveredCandidate of discoveredCandidates || []) {
+    ensureCurrentTask();
+    const discoveredCandidate = normalizePdfCandidate(rawDiscoveredCandidate, rawDiscoveredCandidate?.kind || 'direct_pdf');
+    if (!discoveredCandidate?.url || discoveredCandidate.kind !== 'direct_pdf') {
+      continue;
+    }
+    emitIfCurrent({
+      ...initialStatus,
+      state: 'downloading',
+      progress: 0,
+      openTarget: discoveredCandidate.url,
+      message: '已发现真实 PDF，正在缓存…',
+      reasonCode: 'ready_remote',
+    });
+    const response = await sessionFetchWithFallback(ses, discoveredCandidate.url, {
+      redirect: 'follow',
+      headers: pdfFetchHeaders(discoveredCandidate),
+    });
+    if (!response.ok) {
+      continue;
+    }
+    const reader = response.body?.getReader ? response.body.getReader() : null;
+    let firstChunk = Buffer.alloc(0);
+    let bodyBuffer = null;
+    if (reader) {
+      const first = await reader.read();
+      ensureCurrentTask();
+      if (!first.done) {
+        firstChunk = Buffer.from(first.value);
+      }
+    } else {
+      bodyBuffer = Buffer.from(await response.arrayBuffer());
+      ensureCurrentTask();
+      firstChunk = bodyBuffer.subarray(0, Math.min(bodyBuffer.length, 1024));
+    }
+    if (!validatePdfSignature(firstChunk, response, normalized)) {
+      continue;
+    }
+    const streamed = await streamPdfToTempPath({
+      tempPath,
+      response,
+      reader,
+      firstChunk,
+      bodyBuffer,
+      initialStatus,
+      candidate: discoveredCandidate,
+      emitIfCurrent,
+      ensureCurrentTask,
+    });
+    return {
+      status: 'success',
+      tempPath,
+      sourceUrl: String(response.url || discoveredCandidate.url || '').trim(),
+      ...streamed,
+    };
+  }
+  return null;
+}
+
+async function resolvePdfViaBrowserSession({
+  normalized,
+  candidate,
+  tempPath,
+  initialStatus,
+  emitIfCurrent,
+  ensureCurrentTask,
+}) {
+  const browserWindow = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 920,
+    backgroundColor: '#0f172a',
+    autoHideMenuBar: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      partition: `persist:deepxiv-pdf-resolver`,
+    },
+  });
+
+  try {
+    browserWindow.webContents.setWindowOpenHandler(({ url }) => {
+      if (url && /^https?:\/\//i.test(url)) {
+        browserWindow.loadURL(url).catch(() => {});
+      }
+      return { action: 'deny' };
+    });
+    browserWindow.webContents.setUserAgent(browserResolverUserAgent());
+
+    emitIfCurrent({
+      ...initialStatus,
+      state: 'checking',
+      progress: 0,
+      openTarget: candidate?.url || normalized?.target,
+      message: '正在浏览器验证…',
+      reasonCode: 'needs_browser_resolution',
+    });
+
+    await browserWindow.loadURL(candidate.url, { userAgent: browserResolverUserAgent() });
+    await waitForBrowserResolutionSettled(browserWindow.webContents, PDF_BROWSER_RESOLUTION_TIMEOUT_MS);
+    ensureCurrentTask();
+
+    const discoveredCandidates = [];
+    const seen = new Set();
+    const pushDiscovered = (rawCandidate) => {
+      const normalizedCandidate = normalizePdfCandidate(rawCandidate, rawCandidate?.kind || 'landing_page');
+      if (!normalizedCandidate?.url) return;
+      const key = `${normalizedCandidate.kind}:${normalizedCandidate.url}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      discoveredCandidates.push(normalizedCandidate);
+    };
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      ensureCurrentTask();
+      const domResult = await extractPdfCandidatesFromDom(browserWindow.webContents).catch(() => null);
+      if (domResult?.url) {
+        pushDiscovered({
+          url: domResult.url,
+          kind: looksLikePdfUrl(domResult.url) ? 'direct_pdf' : 'landing_page',
+          source: 'browser:location',
+        });
+      }
+      for (const rawCandidate of domResult?.candidates || []) {
+        pushDiscovered(rawCandidate);
+      }
+
+      const directCandidates = discoveredCandidates.filter((item) => item.kind === 'direct_pdf');
+      if (directCandidates.length) {
+        const resolved = await tryBrowserResolvedPdfCandidates({
+          browserWindow,
+          normalized,
+          discoveredCandidates: directCandidates,
+          tempPath,
+          candidate,
+          initialStatus,
+          emitIfCurrent,
+          ensureCurrentTask,
+        });
+        if (resolved) {
+          return resolved;
+        }
+      }
+
+      if (attempt < 3) {
+        await delay(PDF_BROWSER_RESOLUTION_POLL_MS);
+      }
+    }
+
+    return {
+      status: 'continue',
+      failure: {
+        reasonCode: 'browser_verified_no_pdf',
+        url: candidate?.url || '',
+        message: '浏览器验证后未发现可下载 PDF',
+      },
+      discoveredCandidates: discoveredCandidates.filter((item) => item.kind !== 'direct_pdf'),
+    };
+  } finally {
+    if (!browserWindow.isDestroyed()) {
+      browserWindow.destroy();
+    }
+  }
+}
+
+async function readResponseBodyPreview(reader, firstChunk, byteLimit = PDF_HTML_PREVIEW_LIMIT_BYTES) {
+  const chunks = [];
+  let total = 0;
+  const pushChunk = (chunk) => {
+    if (!chunk?.length || total >= byteLimit) return;
+    const remaining = byteLimit - total;
+    const sliced = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+    chunks.push(sliced);
+    total += sliced.length;
+  };
+  pushChunk(Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk || []));
+  if (!reader) {
+    return Buffer.concat(chunks, total);
+  }
+  while (total < byteLimit) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pushChunk(Buffer.from(value));
+  }
+  try {
+    await reader.cancel();
+  } catch (error) {
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function extractPdfCandidatesFromHtml(htmlText, baseUrl, depth = 0) {
+  const html = String(htmlText || '');
+  if (!html.trim()) return [];
+  const seen = new Set();
+  const result = [];
+
+  const push = (url, kind, source) => {
+    const resolved = resolveCandidateUrl(url, baseUrl);
+    if (!resolved) return;
+    const key = `${kind}:${resolved}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push({
+      url: resolved,
+      kind,
+      source,
+      label: 'Landing page',
+      depth,
+    });
+  };
+
+  const metaPatterns = [
+    /<meta[^>]+(?:name|property)=["']citation_pdf_url["'][^>]+content=["']([^"']+)["'][^>]*>/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:name|property)=["']citation_pdf_url["'][^>]*>/gi,
+    /<meta[^>]+(?:name|property)=["']wkhealth_pdf_url["'][^>]+content=["']([^"']+)["'][^>]*>/gi,
+    /<meta[^>]+(?:name|property)=["']dc\.identifier["'][^>]+content=["']([^"']+pdf[^"']*)["'][^>]*>/gi,
+    /<meta[^>]+(?:name|property)=["']pdf_url["'][^>]+content=["']([^"']+)["'][^>]*>/gi,
+  ];
+
+  for (const pattern of metaPatterns) {
+    let match;
+    while ((match = pattern.exec(html)) !== null) {
+      push(match[1], 'direct_pdf', 'html:meta');
+    }
+  }
+
+  const jsonPatterns = [
+    /"(?:citation_pdf_url|pdf_url|pdfUrl|downloadPdfUrl|download_url)"\s*:\s*"([^"]+)"/gi,
+    /'(?:citation_pdf_url|pdf_url|pdfUrl|downloadPdfUrl|download_url)'\s*:\s*'([^']+)'/gi,
+  ];
+  for (const pattern of jsonPatterns) {
+    let match;
+    while ((match = pattern.exec(html)) !== null) {
+      push(match[1], 'direct_pdf', 'html:json');
+    }
+  }
+
+  const linkPattern = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,240}?)<\/a>/gi;
+  let linkMatch;
+  while ((linkMatch = linkPattern.exec(html)) !== null) {
+    const href = linkMatch[1];
+    const label = decodeHtmlEntitiesLite(linkMatch[2]).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (looksLikePdfUrl(href) || /\b(pdf|download)\b/.test(label)) {
+      push(href, 'direct_pdf', 'html:anchor');
+    }
+  }
+
+  const hrefPattern = /\b(?:href|src|data-pdf-url|data-pdf|data-url)=["']([^"']+)["']/gi;
+  let hrefMatch;
+  while ((hrefMatch = hrefPattern.exec(html)) !== null) {
+    const href = hrefMatch[1];
+    if (looksLikePdfUrl(href)) {
+      push(href, 'direct_pdf', 'html:href');
+    }
+  }
+
+  return result.slice(0, PDF_RESOLVER_MAX_CANDIDATES);
+}
+
+function summarizePdfResolutionFailure(failures, normalized) {
+  const reasons = new Set((failures || []).map((item) => String(item?.reasonCode || '').trim()).filter(Boolean));
+  if (reasons.has('source_timeout')) {
+    return { message: 'PDF 缓存超时', reasonCode: 'source_timeout' };
+  }
+  if (reasons.has('browser_verified_no_pdf')) {
+    return { message: '浏览器验证后未发现可下载 PDF', reasonCode: 'browser_verified_no_pdf' };
+  }
+  if (reasons.has('source_paywalled')) {
+    return { message: '源站存在权限限制', reasonCode: 'source_paywalled' };
+  }
+  if (reasons.has('landing_page_only') && reasons.has('source_restricted')) {
+    return { message: '源站限制 PDF 直连，且落地页未发现可用 PDF', reasonCode: 'landing_page_only' };
+  }
+  if (reasons.has('landing_page_only')) {
+    return { message: '源站仅提供论文落地页，未发现可用 PDF', reasonCode: 'landing_page_only' };
+  }
+  if (reasons.has('source_restricted')) {
+    return { message: '源站限制 PDF 直连', reasonCode: 'source_restricted' };
+  }
+  if (reasons.has('no_open_access_pdf')) {
+    return { message: '源站未提供可用 PDF', reasonCode: 'no_open_access_pdf' };
+  }
+  if (reasons.has('cache_failed')) {
+    return { message: '返回内容不是 PDF 文件', reasonCode: 'cache_failed' };
+  }
+  return {
+    message: defaultPdfReasonMessage(normalized) || 'PDF 缓存失败',
+    reasonCode: normalized?.reasonCode || 'cache_failed',
+  };
+}
+
 function toPdfPrefetchUserMessage(error) {
   const message = String(error?.message || error || '').trim();
+  if (/正在浏览器验证/.test(message)) {
+    return '正在浏览器验证…';
+  }
+  if (/浏览器验证后未发现可下载 PDF/.test(message)) {
+    return '浏览器验证后未发现可下载 PDF';
+  }
+  if (/源站存在权限限制/.test(message)) {
+    return '源站存在权限限制';
+  }
+  if (/限制 PDF 直连/.test(message)) {
+    return '源站限制 PDF 直连';
+  }
+  if (/仅提供论文落地页/.test(message)) {
+    return '源站仅提供论文落地页';
+  }
+  if (/不是 PDF 文件/.test(message)) {
+    return '返回内容不是 PDF 文件';
+  }
   if (/403/.test(message)) {
     return '源站限制 PDF 直连';
   }
   if (/404/.test(message)) {
     return '源站未提供可用 PDF';
+  }
+  if (/源站未提供可用 PDF/.test(message)) {
+    return '源站未提供可用 PDF';
+  }
+  if (/落地页未发现可用 PDF/.test(message)) {
+    return '源站仅提供论文落地页，未发现可用 PDF';
+  }
+  if (/缺少有效的 PMCID|PMC 当前未提供可下载|PMC OA 包中未找到 PDF/i.test(message)) {
+    return '该记录暂无可缓存 PMC PDF';
+  }
+  if (/不是有效 PDF|不是有效 pdf|返回内容不是有效 PDF|缓存后的 PDF 文件无效/i.test(message)) {
+    return '返回内容不是 PDF 文件';
   }
   if (/timed out|timeout/i.test(message)) {
     return 'PDF 缓存超时';
@@ -445,40 +1965,399 @@ async function cachePmcPdfViaBridge(normalized, tempPath) {
   };
 }
 
-async function startPdfPrefetch(normalized) {
-  const existing = pdfPrefetchTasks.get(normalized.paperKey);
-  if (existing) {
-    return clonePdfStatus(pdfPrefetchStatuses.get(normalized.paperKey) || null);
+function clampPdfProgress(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(0.99, numeric));
+}
+
+function pdfFetchHeaders(candidate) {
+  if (candidate?.kind === 'landing_page') {
+    return {
+      'User-Agent': `DeepXiv Client/${app.getVersion()}`,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+    };
+  }
+  return {
+    'User-Agent': `DeepXiv Client/${app.getVersion()}`,
+    'Accept': 'application/pdf,application/octet-stream;q=0.9,text/html;q=0.6,*/*;q=0.5',
+  };
+}
+
+async function streamPdfToTempPath({ tempPath, response, reader, firstChunk, bodyBuffer, initialStatus, candidate, emitIfCurrent, ensureCurrentTask }) {
+  const totalBytes = Number(response.headers.get('content-length') || 0);
+  let receivedBytes = 0;
+  let fileHandle = null;
+  try {
+    fileHandle = await fsp.open(tempPath, 'w');
+    if (bodyBuffer?.length) {
+      await fileHandle.write(bodyBuffer);
+      receivedBytes = bodyBuffer.length;
+    } else {
+      const first = Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk || []);
+      if (first.length) {
+        receivedBytes += first.length;
+        await fileHandle.write(first);
+      }
+      while (reader) {
+        const { done, value } = await reader.read();
+        ensureCurrentTask();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        receivedBytes += chunk.length;
+        await fileHandle.write(chunk);
+        const progress = totalBytes > 0 ? clampPdfProgress(receivedBytes / totalBytes) : 0;
+        emitIfCurrent({
+          ...initialStatus,
+          state: 'downloading',
+          progress,
+          openTarget: candidate?.url || initialStatus.openTarget,
+          message: totalBytes > 0 ? `正在准备 PDF… ${Math.round(progress * 100)}%` : '正在准备 PDF…',
+        });
+      }
+    }
+  } finally {
+    if (fileHandle) {
+      await fileHandle.close().catch(() => {});
+    }
+  }
+  return {
+    totalBytes: totalBytes || receivedBytes,
+    receivedBytes,
+  };
+}
+
+async function resolvePdfCandidateToCache({ normalized, candidate, tempPath, taskRecord, initialStatus, emitIfCurrent, ensureCurrentTask }) {
+  const controller = new AbortController();
+  if (!taskRecord.abortControllers) {
+    taskRecord.abortControllers = new Set();
+  }
+  taskRecord.abortController = controller;
+  taskRecord.abortControllers.add(controller);
+  const timeoutMs = candidate?.kind === 'landing_page' ? PDF_LANDING_FETCH_TIMEOUT_MS : PDF_FETCH_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let succeeded = false;
+  try {
+    emitIfCurrent({
+      ...initialStatus,
+      state: candidate?.kind === 'landing_page' ? 'checking' : 'downloading',
+      progress: 0,
+      openTarget: candidate?.url || normalized?.target,
+      message: candidate?.kind === 'landing_page' ? '正在解析源站页面…' : '正在准备 PDF…',
+    });
+
+    const response = await fetch(candidate.url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: pdfFetchHeaders(candidate),
+    });
+    clearTimeout(timer);
+    ensureCurrentTask();
+
+    if (!response.ok) {
+      const reasonCode = response.status === 401 || response.status === 403
+        ? 'source_restricted'
+        : response.status === 404
+          ? 'no_open_access_pdf'
+          : 'cache_failed';
+      const failedClassification = {
+        reasonCode,
+        finalUrl: String(response.url || candidate.url || '').trim(),
+        needsBrowserVerification: reasonCode === 'source_restricted' && shouldAttemptBrowserResolution(candidate, { reasonCode }),
+      };
+      if (shouldAttemptBrowserResolution(candidate, failedClassification)) {
+        const browserResolved = await resolvePdfViaBrowserSession({
+          normalized,
+          candidate: {
+            ...candidate,
+            url: String(normalized.externalUrl || candidate.url || '').trim() || candidate.url,
+          },
+          tempPath,
+          initialStatus,
+          emitIfCurrent,
+          ensureCurrentTask,
+        });
+        if (browserResolved?.status === 'success') {
+          succeeded = true;
+          return browserResolved;
+        }
+        return browserResolved || {
+          status: 'continue',
+          failure: {
+            reasonCode,
+            url: candidate.url,
+            status: response.status,
+          },
+          discoveredCandidates: [],
+        };
+      }
+      return {
+        status: 'continue',
+        failure: {
+          reasonCode,
+          url: candidate.url,
+          status: response.status,
+        },
+        discoveredCandidates: [],
+      };
+    }
+
+    const reader = response.body?.getReader ? response.body.getReader() : null;
+    let firstChunk = Buffer.alloc(0);
+    let bodyBuffer = null;
+
+    if (reader) {
+      const first = await reader.read();
+      ensureCurrentTask();
+      if (!first.done) {
+        firstChunk = Buffer.from(first.value);
+      }
+    } else {
+      bodyBuffer = Buffer.from(await response.arrayBuffer());
+      ensureCurrentTask();
+      firstChunk = bodyBuffer.subarray(0, Math.min(bodyBuffer.length, 1024));
+    }
+
+    if (validatePdfSignature(firstChunk, response, normalized)) {
+      const streamed = await streamPdfToTempPath({
+        tempPath,
+        response,
+        reader,
+        firstChunk,
+        bodyBuffer,
+        initialStatus,
+        candidate,
+        emitIfCurrent,
+        ensureCurrentTask,
+      });
+      succeeded = true;
+      return {
+        status: 'success',
+        tempPath,
+        sourceUrl: String(response.url || candidate.url || '').trim(),
+        ...streamed,
+      };
+    }
+
+    const previewBuffer = bodyBuffer || await readResponseBodyPreview(reader, firstChunk, PDF_HTML_PREVIEW_LIMIT_BYTES);
+    const classification = classifyInvalidPdfResponse(previewBuffer, response, normalized, candidate);
+    const discoveredCandidates = [];
+    if (classification.canParseLandingPage && (candidate.depth || 0) < 2) {
+      discoveredCandidates.push(...extractPdfCandidatesFromHtml(
+        previewBuffer.toString('utf8'),
+        classification.finalUrl || response.url || candidate.url,
+        (candidate.depth || 0) + 1,
+      ));
+    }
+
+    if (shouldAttemptBrowserResolution(candidate, classification) || (!discoveredCandidates.length && candidate?.kind === 'landing_page')) {
+      const browserResolved = await resolvePdfViaBrowserSession({
+        normalized,
+        candidate: {
+          ...candidate,
+          url: String(classification.finalUrl || normalized.externalUrl || candidate.url || '').trim() || candidate.url,
+        },
+        tempPath,
+        initialStatus,
+        emitIfCurrent,
+        ensureCurrentTask,
+      });
+      if (browserResolved?.status === 'success') {
+        succeeded = true;
+        return browserResolved;
+      }
+      if (browserResolved?.discoveredCandidates?.length) {
+        discoveredCandidates.push(...browserResolved.discoveredCandidates);
+      }
+      if (browserResolved?.failure) {
+        return {
+          status: 'continue',
+          failure: browserResolved.failure,
+          discoveredCandidates,
+        };
+      }
+    }
+
+    return {
+      status: 'continue',
+      failure: {
+        reasonCode: classification.reasonCode,
+        url: classification.finalUrl || candidate.url,
+        message: classification.message,
+      },
+      discoveredCandidates,
+    };
+  } catch (error) {
+    if (String(error?.message || '') === '__PDF_PREFETCH_REPLACED__') {
+      throw error;
+    }
+    return {
+      status: 'continue',
+      failure: {
+        reasonCode: String(error?.name || '') === 'AbortError' ? 'source_timeout' : 'cache_failed',
+        url: candidate?.url || '',
+        message: String(error?.name || '') === 'AbortError'
+          ? 'PDF 缓存超时'
+          : String(error?.message || error || 'PDF 缓存失败').trim(),
+      },
+      discoveredCandidates: [],
+    };
+  } finally {
+    clearTimeout(timer);
+    taskRecord.abortControllers?.delete(controller);
+    if (!succeeded) {
+      await fsp.rm(tempPath, { force: true }).catch(() => {});
+    }
+  }
+}
+
+async function resolvePdfCandidatesInParallel({ normalized, tempPath, taskRecord, initialStatus, emitIfCurrent, ensureCurrentTask }) {
+  const queue = buildPdfResolverCandidates(normalized);
+  const queueSeen = new Set(queue.map((candidate) => `${candidate.kind}:${candidate.url}`));
+  const failures = [];
+  const active = new Map();
+  let winner = null;
+  let attemptId = 0;
+
+  const launchNext = () => {
+    while (!winner && active.size < PDF_RESOLVER_PARALLELISM && queue.length) {
+      const candidate = queue.shift();
+      const currentAttemptId = ++attemptId;
+      const attemptTempPath = `${tempPath}.${currentAttemptId}`;
+      const promise = resolvePdfCandidateToCache({
+        normalized,
+        candidate,
+        tempPath: attemptTempPath,
+        taskRecord,
+        initialStatus,
+        emitIfCurrent,
+        ensureCurrentTask,
+      }).then((result) => ({
+        attemptId: currentAttemptId,
+        candidate,
+        ...result,
+      }));
+      active.set(currentAttemptId, promise);
+    }
+  };
+
+  launchNext();
+
+  while (!winner && active.size) {
+    ensureCurrentTask();
+    const settled = await Promise.race(active.values());
+    active.delete(settled.attemptId);
+
+    if (settled.status === 'success') {
+      winner = settled;
+      break;
+    }
+
+    if (settled.failure) {
+      failures.push(settled.failure);
+    }
+
+    for (const discoveredCandidate of settled.discoveredCandidates || []) {
+      enqueuePdfCandidate(
+        queue,
+        queueSeen,
+        discoveredCandidate,
+        discoveredCandidate.kind || 'direct_pdf',
+        { depth: discoveredCandidate.depth || ((settled.candidate?.depth || 0) + 1) },
+        { front: discoveredCandidate.kind === 'direct_pdf' },
+      );
+    }
+
+    launchNext();
   }
 
-  const initialStatus = emitPdfPrefetchStatus({
-    paperKey: normalized.paperKey,
-    title: normalized.title,
+  if (winner) {
+    abortPdfPrefetchControllers(taskRecord);
+    const remaining = await Promise.allSettled(active.values());
+    for (const entry of remaining) {
+      if (entry.status !== 'fulfilled') continue;
+      const result = entry.value;
+      if (result?.status === 'success' && result.tempPath && result.tempPath !== winner.tempPath) {
+        await fsp.rm(result.tempPath, { force: true }).catch(() => {});
+      }
+    }
+  } else if (active.size) {
+    await Promise.allSettled(active.values());
+  }
+
+  return { winner, failures };
+}
+
+async function startPdfPrefetch(normalized) {
+  const signature = pdfPrefetchTaskSignature(normalized);
+  const existing = pdfPrefetchTasks.get(normalized.paperKey);
+  if (existing?.signature === signature) {
+    return clonePdfStatus(pdfPrefetchStatuses.get(normalized.paperKey) || null);
+  }
+  abortPdfPrefetchControllers(existing);
+
+  const taskToken = sha1(`${normalized.paperKey}|${signature}|${Date.now()}|${Math.random()}`);
+  const taskRecord = {
+    signature,
+    token: taskToken,
+    abortController: null,
+    abortControllers: new Set(),
+    promise: null,
+  };
+  pdfPrefetchTasks.set(normalized.paperKey, taskRecord);
+
+  const isCurrentTask = () => pdfPrefetchTasks.get(normalized.paperKey)?.token === taskToken;
+  const ensureCurrentTask = () => {
+    if (!isCurrentTask()) {
+      throw new Error('__PDF_PREFETCH_REPLACED__');
+    }
+  };
+  const emitIfCurrent = (status) => {
+    if (!isCurrentTask()) {
+      return clonePdfStatus(status);
+    }
+    return emitPdfPrefetchStatus(status);
+  };
+
+  const initialStatus = emitIfCurrent(createPdfPrefetchStatus(normalized, {
     state: 'downloading',
     progress: 0,
-    target: normalized.target,
-    sourceUrl: normalized.sourceUrl,
-    cachedPath: '',
-    openTarget: normalized.sourceUrl || normalized.target,
-    message: '正在缓存 PDF…',
-    isCached: false,
-  });
+    openTarget: normalized.sourceUrl || normalized.externalUrl || normalized.target,
+    message: isPmcOaCandidate(normalized) ? '正在准备 PDF…可稍后打开' : '正在准备 PDF…',
+    reasonCode: normalized.reasonCode || (isPmcOaCandidate(normalized) ? 'needs_pmc_resolution' : 'ready_remote'),
+  }));
 
-  const task = (async () => {
-    const tempPath = `${normalized.cachePath}.download`;
-    let fileHandle = null;
+  taskRecord.promise = (async () => {
+    const tempPath = `${normalized.cachePath}.${taskToken}.download`;
+    let winningTempPath = '';
     try {
       await fsp.mkdir(path.dirname(normalized.cachePath), { recursive: true });
+      ensureCurrentTask();
 
       if (isPmcOaCandidate(normalized)) {
         const pmcResult = await cachePmcPdfViaBridge(normalized, tempPath);
+        ensureCurrentTask();
+        emitIfCurrent({
+          ...initialStatus,
+          state: 'verifying',
+          progress: 0.99,
+          sourceUrl: pmcResult.sourceUrl || normalized.sourceUrl,
+          cachedPath: '',
+          openTarget: normalized.target,
+          message: '正在准备 PDF…可稍后打开',
+          isCached: false,
+          reasonCode: 'needs_pmc_resolution',
+        });
         await fsp.rename(pmcResult.cachedPath, normalized.cachePath);
+        ensureCurrentTask();
         const valid = await validatePdfFilePath(normalized.cachePath);
         if (!valid) {
           await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
           throw new Error('缓存后的 PDF 文件无效');
         }
-        emitPdfPrefetchStatus({
+        emitIfCurrent({
           ...initialStatus,
           state: 'ready',
           progress: 1,
@@ -487,123 +2366,118 @@ async function startPdfPrefetch(normalized) {
           openTarget: normalized.cachePath,
           message: 'PDF 已缓存，下次打开更快',
           isCached: true,
+          reasonCode: 'ready_remote',
         });
         return;
       }
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 180000);
-      const response = await fetch(normalized.sourceUrl, {
-        redirect: 'follow',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': `DeepXiv Client/${app.getVersion()}`,
-          'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
-        },
+      const primaryResolution = await resolvePdfCandidatesInParallel({
+        normalized,
+        tempPath,
+        taskRecord,
+        initialStatus,
+        emitIfCurrent,
+        ensureCurrentTask,
       });
-      clearTimeout(timer);
+      let winner = primaryResolution?.winner || null;
+      let failures = [...(primaryResolution?.failures || [])];
 
-      if (!response.ok) {
-        throw new Error(`下载 PDF 失败（${response.status}）`);
-      }
-
-      const totalBytes = Number(response.headers.get('content-length') || 0);
-      const reader = response.body?.getReader ? response.body.getReader() : null;
-      let receivedBytes = 0;
-      let firstChunk = Buffer.alloc(0);
-      fileHandle = await fsp.open(tempPath, 'w');
-
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = Buffer.from(value);
-          if (!firstChunk.length) {
-            firstChunk = chunk;
-          }
-          receivedBytes += chunk.length;
-          await fileHandle.write(chunk);
-          emitPdfPrefetchStatus({
-            ...initialStatus,
-            state: 'downloading',
-            progress: totalBytes > 0 ? Math.min(0.99, receivedBytes / totalBytes) : 0,
-            message: totalBytes > 0 ? `正在缓存 PDF… ${Math.round((receivedBytes / totalBytes) * 100)}%` : '正在缓存 PDF…',
-          });
+      if (!winner) {
+        const siblingResolution = await resolvePdfViaSiblingFallback({
+          normalized,
+          tempPath,
+          taskRecord,
+          initialStatus,
+          emitIfCurrent,
+          ensureCurrentTask,
+        });
+        if (siblingResolution?.winner) {
+          winner = siblingResolution.winner;
+        } else if (siblingResolution?.failures?.length) {
+          failures = failures.concat(siblingResolution.failures);
         }
-      } else {
-        const buffer = Buffer.from(await response.arrayBuffer());
-        firstChunk = buffer.subarray(0, Math.min(buffer.length, 8));
-        receivedBytes = buffer.length;
-        await fileHandle.write(buffer);
       }
 
-      await fileHandle.close();
-      fileHandle = null;
-
-      if (!validatePdfSignature(firstChunk, response, normalized)) {
-        throw new Error('返回内容不是有效 PDF');
+      if (!winner) {
+        const summary = summarizePdfResolutionFailure(failures, normalized);
+        throw new Error(summary.message || 'PDF 缓存失败');
       }
+      winningTempPath = winner.tempPath || '';
+      let resolvedSourceUrl = winner.sourceUrl || normalized.sourceUrl || normalized.externalUrl || '';
+      const resolvedStatus = resolvedPdfStatusFields(winner);
 
-      await fsp.rename(tempPath, normalized.cachePath);
+      ensureCurrentTask();
+      emitIfCurrent({
+        ...initialStatus,
+        state: 'verifying',
+        progress: 0.99,
+        sourceUrl: resolvedSourceUrl,
+        cachedPath: '',
+        openTarget: normalized.target,
+        message: '正在校验 PDF…',
+        isCached: false,
+        ...resolvedStatus,
+      });
+
+      await fsp.rename(winner.tempPath, normalized.cachePath);
+      ensureCurrentTask();
       const valid = await validatePdfFilePath(normalized.cachePath);
       if (!valid) {
         await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
         throw new Error('缓存后的 PDF 文件无效');
       }
 
-      emitPdfPrefetchStatus({
+      emitIfCurrent({
         ...initialStatus,
         state: 'ready',
         progress: 1,
-        sourceUrl: response.url || normalized.sourceUrl,
+        sourceUrl: resolvedSourceUrl,
         cachedPath: normalized.cachePath,
         openTarget: normalized.cachePath,
-        message: 'PDF 已缓存，下次打开更快',
+        message: formatResolvedPdfReadyMessage('PDF 已缓存，下次打开更快', winner),
         isCached: true,
-        totalBytes: totalBytes || receivedBytes,
-        receivedBytes,
+        reasonCode: 'ready_remote',
+        totalBytes: winner.totalBytes,
+        receivedBytes: winner.receivedBytes,
+        ...resolvedStatus,
       });
     } catch (error) {
-      if (fileHandle) {
-        try {
-          await fileHandle.close();
-        } catch (closeError) {
-        }
-      }
       await fsp.rm(tempPath, { force: true }).catch(() => {});
-      emitPdfPrefetchStatus({
+      if (winningTempPath) {
+        await fsp.rm(winningTempPath, { force: true }).catch(() => {});
+      }
+      if (String(error?.message || '') === '__PDF_PREFETCH_REPLACED__') {
+        return;
+      }
+      emitIfCurrent({
         ...initialStatus,
         state: 'error',
         progress: 0,
-        openTarget: normalized.sourceUrl || normalized.target,
+        openTarget: normalized.sourceUrl || normalized.externalUrl || normalized.target,
         message: String(error?.name || '') === 'AbortError' ? 'PDF 缓存超时' : toPdfPrefetchUserMessage(error),
         error: String(error?.message || error || 'PDF 缓存失败').trim(),
+        reasonCode: String(error?.name || '') === 'AbortError' ? 'source_timeout' : 'cache_failed',
         isCached: false,
       });
     } finally {
-      pdfPrefetchTasks.delete(normalized.paperKey);
+      abortPdfPrefetchControllers(taskRecord);
+      if (isCurrentTask()) {
+        pdfPrefetchTasks.delete(normalized.paperKey);
+      }
     }
   })();
 
-  pdfPrefetchTasks.set(normalized.paperKey, task);
   return initialStatus;
 }
 
 async function prefetchPdf(payload = {}) {
   const normalized = normalizePdfPayload(payload);
-  if (!normalized.paperKey || !normalized.target) {
-    return {
-      paperKey: normalized.paperKey || '',
-      title: normalized.title,
+  if (!normalized.paperKey || (!normalized.target && !normalized.externalUrl && !normalized.sourceUrl && !normalized.localPath && !normalized.pmcid && !(normalized.pdfCandidates || []).length)) {
+    return createPdfPrefetchStatus(normalized, {
       state: 'missing',
-      progress: 0,
-      target: normalized.target,
-      sourceUrl: normalized.sourceUrl,
-      cachedPath: '',
       openTarget: '',
-      message: '未找到可用 PDF',
-      isCached: false,
-    };
+      message: defaultPdfReasonMessage(normalized),
+    });
   }
 
   const cachedStatus = await getCachedPdfStatus(normalized);
@@ -611,22 +2485,15 @@ async function prefetchPdf(payload = {}) {
     return cachedStatus;
   }
 
-  if (normalized.sourceUrl && looksLikePdfUrl(normalized.sourceUrl)) {
+  if (normalized.localPath || normalized.sourceUrl || normalized.externalUrl || normalized.pmcid || (normalized.pdfCandidates || []).length) {
     return startPdfPrefetch(normalized);
   }
 
-  return emitPdfPrefetchStatus({
-    paperKey: normalized.paperKey,
-    title: normalized.title,
+  return emitPdfPrefetchStatus(createPdfPrefetchStatus(normalized, {
     state: 'missing',
-    progress: 0,
-    target: normalized.target,
-    sourceUrl: normalized.sourceUrl,
-    cachedPath: '',
     openTarget: normalized.localPath || normalized.target,
-    message: '当前论文没有可缓存的 PDF 直链',
-    isCached: false,
-  });
+    message: defaultPdfReasonMessage(normalized),
+  }));
 }
 
 async function resolvePdfForOpen(payload = {}) {
@@ -641,59 +2508,12 @@ async function resolvePdfForOpen(payload = {}) {
   };
 }
 
-function bufferToArrayBuffer(buffer) {
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-}
-
-async function fetchPdfBuffer(sourceUrl, normalized) {
-  const url = String(sourceUrl || '').trim();
-  if (!url) {
-    throw new Error('缺少 PDF 下载地址');
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 180000);
-  try {
-    const response = await fetch(url, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': `DeepXiv Client/${app.getVersion()}`,
-        'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
-      },
-    });
-    if (!response.ok) {
-      throw new Error(`获取 PDF 失败（${response.status}）`);
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (!validatePdfSignature(buffer.subarray(0, Math.min(buffer.length, 8)), response, normalized)) {
-      throw new Error('返回内容不是有效 PDF');
-    }
-    return {
-      buffer,
-      sourceUrl: response.url || url,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function ensurePdfReadyForRead(normalized) {
   const cachedStatus = await getCachedPdfStatus(normalized);
   if (cachedStatus?.state === 'ready' && cachedStatus.openTarget && !isRemoteHttpUrl(cachedStatus.openTarget)) {
     return cachedStatus;
   }
   return cachedStatus;
-}
-
-function prefetchPdfInBackground(normalized) {
-  if (!normalized?.paperKey || !normalized?.sourceUrl || !looksLikePdfUrl(normalized.sourceUrl)) {
-    return;
-  }
-  if (pdfPrefetchTasks.get(normalized.paperKey)) {
-    return;
-  }
-  startPdfPrefetch(normalized).catch(() => {});
 }
 
 async function loadPdfDocument(payload = {}) {
@@ -703,42 +2523,44 @@ async function loadPdfDocument(payload = {}) {
   }
 
   const readyStatus = await ensurePdfReadyForRead(normalized);
-  const readyLocalTarget = String(readyStatus?.cachedPath || readyStatus?.openTarget || normalized.localPath || '').trim();
-  const remoteTarget = String(normalized.sourceUrl || normalized.target || '').trim();
-  const openTarget = readyLocalTarget || remoteTarget;
+  const openTarget = String(readyStatus?.cachedPath || readyStatus?.openTarget || normalized.localPath || '').trim();
 
   if (!openTarget) {
-    throw new Error('未找到可打开的 PDF');
-  }
-
-  let buffer = null;
-  let sourceUrl = String(readyStatus?.sourceUrl || normalized.sourceUrl || '').trim();
-
-  if (!isRemoteHttpUrl(openTarget)) {
-    if (!(await fileExists(openTarget))) {
-      throw new Error('PDF 文件不存在');
+    if (readyStatus?.state === 'error') {
+      throw new Error(readyStatus.message || readyStatus.error || '当前论文暂未提供可打开的 PDF');
     }
-    buffer = await fsp.readFile(openTarget);
-  } else {
-    prefetchPdfInBackground(normalized);
-    const fetched = await fetchPdfBuffer(openTarget, normalized);
-    buffer = fetched.buffer;
-    sourceUrl = fetched.sourceUrl;
+    if (readyStatus?.state === 'missing') {
+      throw new Error(readyStatus.message || '当前论文暂未提供可打开的 PDF');
+    }
+    throw new Error('PDF 尚未缓存完成');
   }
 
-  if (!buffer?.byteLength) {
-    throw new Error('PDF 内容为空');
+  if (isRemoteHttpUrl(openTarget)) {
+    throw new Error(readyStatus?.message || 'PDF 尚未缓存完成');
+  }
+
+  const valid = await validatePdfFilePath(openTarget);
+  if (!valid) {
+    if (normalized.cachePath && openTarget === normalized.cachePath) {
+      await fsp.rm(normalized.cachePath, { force: true }).catch(() => {});
+      pdfPrefetchStatuses.delete(normalized.paperKey);
+    }
+    throw new Error('缓存后的 PDF 文件无效');
+  }
+
+  const documentUrl = buildPdfDocumentUrl(openTarget, normalized.paperKey);
+  if (!documentUrl) {
+    throw new Error('无法创建 PDF 读取地址');
   }
 
   return {
     paperKey: normalized.paperKey,
     title: normalized.title,
     openTarget,
-    sourceUrl,
+    documentUrl,
+    sourceUrl: String(readyStatus?.sourceUrl || normalized.sourceUrl || '').trim(),
     isCached: readyStatus?.isCached === true,
     isLocal: readyStatus?.isLocal === true || Boolean(normalized.localPath),
-    bytes: bufferToArrayBuffer(buffer),
-    byteLength: buffer.byteLength,
   };
 }
 
@@ -762,6 +2584,10 @@ function normalizeFavoriteEntry(paper = {}, fallbackKey = '') {
     src_url: String(paper.src_url || paper.external_url || '').trim(),
     pdf_url: String(paper.pdf_url || '').trim(),
     local_pdf_path: String(paper.local_pdf_path || '').trim(),
+    pmcid: String(paper.pmcid || '').trim().toUpperCase(),
+    explicit_arxiv_id: paper.explicit_arxiv_id === true,
+    pdf_reason_code: String(paper.pdf_reason_code || '').trim(),
+    pdf_reason_message: String(paper.pdf_reason_message || '').trim(),
     group_id: String(paper.group_id || '').trim() || 'default',
     savedAt: String(paper.savedAt || '').trim() || new Date().toISOString(),
     supports_favorite: true,
@@ -797,6 +2623,9 @@ function buildPaperContextText(paperContext = {}) {
   }
   if (paperContext.sourceUrl) {
     lines.push(`来源链接：${paperContext.sourceUrl}`);
+  }
+  if (paperContext.resolvedFromSibling) {
+    lines.push(`PDF 来源：开放兄弟版本${paperContext.pdfSourceLabel ? `（${paperContext.pdfSourceLabel}）` : ''}`);
   }
   if (paperContext.abstract) {
     lines.push(`摘要：${paperContext.abstract}`);
@@ -1472,7 +3301,7 @@ async function callAi(payload = {}) {
   const paperContext = payload.paperContext || {};
   const history = Array.isArray(payload.messages) ? payload.messages : [];
   const input = [];
-  const hasRemotePdfContext = isRemoteHttpUrl(paperContext.pdfUrl) && looksLikePdfUrl(paperContext.pdfUrl);
+  const hasRemotePdfContext = paperContext.pdfLoaded === true && isRemoteHttpUrl(paperContext.pdfUrl) && looksLikePdfUrl(paperContext.pdfUrl);
   const hasTextContext = Boolean(String(paperContext.contextText || '').trim());
   const contextContent = [{ type: 'input_text', text: buildPaperContextText(paperContext) }];
   if (hasRemotePdfContext) {
@@ -1701,6 +3530,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  registerPdfDocumentProtocol();
   ipcMain.handle('bootstrap', bootstrap);
   ipcMain.handle('status:refresh', refreshStatus);
   ipcMain.handle('token:status', () => callBridge('token-status'));
@@ -1738,7 +3568,17 @@ app.whenReady().then(() => {
         abstract: snapshot.head?.abstract || snapshot.brief?.tldr || bridgePayload.abstract || '',
         external_url: snapshot.brief?.src_url || snapshot.head?.src_url || bridgePayload.external_url || '',
         pdf_url: snapshot.brief?.pdf_url || snapshot.head?.pdf_url || '',
+        pdf_candidates: snapshot.head?.pdf_candidates || bridgePayload.pdf_candidates || [],
         local_pdf_path: snapshot.local_pdf_path || snapshot.head?.local_pdf_path || bridgePayload.local_pdf_path || '',
+        pmcid: snapshot.head?.pmcid || bridgePayload.pmcid || '',
+        explicit_arxiv_id: snapshot.head?.explicit_arxiv_id === true || bridgePayload.explicit_arxiv_id === true,
+        pdf_reason_code: snapshot.head?.pdf_reason_code || bridgePayload.pdf_reason_code || '',
+        pdf_reason_message: snapshot.head?.pdf_reason_message || bridgePayload.pdf_reason_message || '',
+        openalex_content_url: snapshot.head?.openalex_content_url || bridgePayload.openalex_content_url || '',
+        openalex_oa_url: snapshot.head?.openalex_oa_url || bridgePayload.openalex_oa_url || '',
+        openalex_oa_status: snapshot.head?.openalex_oa_status || bridgePayload.openalex_oa_status || '',
+        openalex_is_oa: snapshot.head?.openalex_is_oa === true || bridgePayload.openalex_is_oa === true,
+        openalex_has_content_pdf: snapshot.head?.openalex_has_content_pdf === true || bridgePayload.openalex_has_content_pdf === true,
         full_context_text: snapshot.head?.full_context_text || bridgePayload.full_context_text || '',
         supports_favorite: snapshot.head?.supports_favorite ?? bridgePayload.supports_favorite ?? true,
       });

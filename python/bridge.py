@@ -327,8 +327,21 @@ def normalize_title_key(value: Any) -> str:
 
 
 def extract_arxiv_id(text: str) -> str:
-    match = re.search(r"(?:arxiv\.org/(?:abs|pdf|html)/)?([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?", text, re.IGNORECASE)
-    return match.group(1) if match else ""
+    value = normalize_spaces(text)
+    if not value:
+        return ""
+    plain_match = re.fullmatch(r"([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?", value, re.IGNORECASE)
+    if plain_match:
+        return plain_match.group(1)
+    explicit_patterns = [
+        r"arxiv\.org/(?:abs|pdf|html)/([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?",
+        r"\barxiv[:\s./_-]+([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?",
+    ]
+    for pattern in explicit_patterns:
+        match = re.search(pattern, value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def extract_openalex_id(text: str) -> str:
@@ -357,16 +370,62 @@ def looks_like_probable_pdf_url(url: Any) -> bool:
     if not value or not is_remote_http_url(value):
         return False
     lowered = value.lower()
-    if ".pdf" in lowered or "/pdf/" in lowered or "arxiv.org/pdf/" in lowered or "/download/" in lowered:
+    if (
+        ".pdf" in lowered
+        or "/pdf/" in lowered
+        or "/pdfdirect/" in lowered
+        or "/epdf/" in lowered
+        or "arxiv.org/pdf/" in lowered
+        or "/download/" in lowered
+        or "downloadpdf" in lowered
+        or "articlepdf" in lowered
+        or "fullpdf" in lowered
+    ):
         return True
     parsed = urlsplit(value)
     query = f"{parsed.query}&{parsed.fragment}".lower()
-    return any(token in query for token in ("download=1", "download=true", "format=pdf", "type=pdf"))
+    return any(token in query for token in ("download=1", "download=true", "format=pdf", "type=pdf", "pdf=1"))
 
 
 def is_known_restricted_pdf_host(url: Any) -> bool:
     host = urlsplit(str(url or "").strip()).netloc.lower()
-    return host in {"dl.acm.org", "www.gbv.de"}
+    return host in {"dl.acm.org", "www.gbv.de", "pubs.acs.org"}
+
+
+def build_pdf_candidate(url: Any, kind: str, **extra: Any) -> Optional[Dict[str, Any]]:
+    value = normalize_spaces(url)
+    if not value or not is_remote_http_url(value):
+        return None
+    candidate: Dict[str, Any] = {
+        "url": value,
+        "kind": normalize_spaces(kind) or "direct_pdf",
+        "host": urlsplit(value).netloc.lower(),
+    }
+    for key, raw_value in extra.items():
+        if isinstance(raw_value, str):
+            normalized = normalize_spaces(raw_value)
+            if normalized:
+                candidate[key] = normalized
+        elif raw_value is not None:
+            candidate[key] = raw_value
+    return candidate
+
+
+def append_unique_pdf_candidate(items: List[Dict[str, Any]], seen: set[str], candidate: Optional[Dict[str, Any]]) -> None:
+    if not candidate:
+        return
+    key = json.dumps(
+        {
+            "url": candidate.get("url"),
+            "kind": candidate.get("kind"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    if key in seen:
+        return
+    seen.add(key)
+    items.append(candidate)
 
 
 def local_pdf_key(file_path: Path) -> str:
@@ -891,14 +950,17 @@ def parse_local_pdf(file_path_value: str) -> Dict[str, Any]:
         "openalex_id": "",
         "europepmc_id": "",
         "europepmc_source": "",
+        "pmcid": "",
         "external_url": str(file_path),
         "src_url": str(file_path),
         "pdf_url": "",
         "local_pdf_path": str(file_path),
+        "explicit_arxiv_id": False,
         "supports_favorite": True,
         "full_context_text": context_excerpt,
         "contribution_points": contribution_points,
         "sections": sections,
+        **resolve_pdf_reason("", str(file_path), local=True),
     }
     return result
 
@@ -1006,37 +1068,182 @@ def reconstruct_openalex_abstract(abstract_index: Any) -> str:
     return " ".join(word for word in words if word).strip()
 
 
-def pick_openalex_pdf_url(item: Dict[str, Any]) -> str:
-    best_location = item.get("best_oa_location") or {}
-    primary_location = item.get("primary_location") or {}
+def collect_openalex_locations(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    locations: List[Dict[str, Any]] = []
+    for candidate in (item.get("best_oa_location"), item.get("primary_location")):
+        if isinstance(candidate, dict):
+            locations.append(candidate)
+    raw_locations = item.get("locations") or item.get("locations_by_version") or []
+    if isinstance(raw_locations, list):
+        for candidate in raw_locations:
+            if isinstance(candidate, dict):
+                locations.append(candidate)
+    unique_locations: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in locations:
+        key = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_locations.append(candidate)
+    return unique_locations
+
+
+def collect_openalex_pdf_candidates(item: Dict[str, Any], arxiv_id: str = "") -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
     open_access = item.get("open_access") or {}
-    candidates = [
-        best_location.get("pdf_url"),
-        primary_location.get("pdf_url"),
-        open_access.get("oa_url"),
-    ]
+    content_urls = item.get("content_urls") or {}
+
+    for index, location in enumerate(collect_openalex_locations(item)):
+        source = location.get("source") or {}
+        source_label = normalize_spaces(
+            source.get("display_name")
+            or source.get("host_organization_name")
+            or source.get("host_organization")
+            or ""
+        )
+        location_meta = {
+            "label": source_label,
+            "source": f"openalex:location:{index + 1}",
+            "is_oa": bool(location.get("is_oa")),
+            "license": normalize_spaces(location.get("license")),
+            "version": normalize_spaces(location.get("version")),
+        }
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(location.get("pdf_url"), "direct_pdf", **location_meta),
+        )
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(location.get("landing_page_url"), "landing_page", **location_meta),
+        )
+
+    oa_url = normalize_spaces(open_access.get("oa_url"))
+    if oa_url:
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(
+                oa_url,
+                "direct_pdf" if looks_like_probable_pdf_url(oa_url) else "landing_page",
+                source="openalex:open_access",
+                label="Open access",
+                is_oa=bool(open_access.get("is_oa")),
+            ),
+        )
+
+    content_url = normalize_spaces(content_urls.get("pdf") or item.get("content_url"))
+    if content_url:
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(
+                content_url,
+                "content_api",
+                source="openalex:content_api",
+                label="OpenAlex Content API",
+                is_oa=bool(open_access.get("is_oa")),
+            ),
+        )
+
+    doi_url = normalize_spaces(item.get("doi"))
+    if doi_url:
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(doi_url, "landing_page", source="openalex:doi", label="DOI"),
+        )
+
+    if arxiv_id:
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(build_arxiv_pdf_url(arxiv_id), "direct_pdf", source="openalex:arxiv_pdf", label="arXiv"),
+        )
+        append_unique_pdf_candidate(
+            candidates,
+            seen,
+            build_pdf_candidate(f"https://arxiv.org/abs/{arxiv_id}", "landing_page", source="openalex:arxiv_abs", label="arXiv"),
+        )
+
+    return candidates
+
+
+def openalex_pdf_candidate_priority(candidate: Dict[str, Any]) -> int:
+    url = normalize_spaces(candidate.get("url"))
+    host = urlsplit(url).netloc.lower()
+    source = normalize_spaces(candidate.get("source")).lower()
+    score = 100
+    if normalize_spaces(candidate.get("kind")).lower() == "direct_pdf":
+        score -= 20
+    if "arxiv" in source or host == "arxiv.org":
+        score -= 50
+    if "pmc" in source or host.endswith("ncbi.nlm.nih.gov"):
+        score -= 45
+    if "open_access" in source:
+        score -= 35
+    if host.endswith("europepmc.org"):
+        score -= 25
+    if host in {"onlinelibrary.wiley.com", "www.onlinelibrary.wiley.com", "ieeexplore.ieee.org", "dl.acm.org", "pubs.acs.org"}:
+        score += 20
+    if host in {"dl.acm.org", "www.gbv.de", "pubs.acs.org"}:
+        score += 25
+    return score
+
+
+def pick_openalex_arxiv_id(item: Dict[str, Any]) -> str:
+    ids = item.get("ids") or {}
+    candidates: List[Any] = [ids.get("arxiv")]
+    for location in collect_openalex_locations(item):
+        candidates.extend([location.get("pdf_url"), location.get("landing_page_url")])
     for candidate in candidates:
-        url = normalize_spaces(candidate)
-        if looks_like_probable_pdf_url(url) and not is_known_restricted_pdf_host(url):
-            return url
+        arxiv_id = extract_arxiv_id(str(candidate or ""))
+        if arxiv_id:
+            return arxiv_id
     return ""
 
 
-def pick_openalex_external_url(item: Dict[str, Any], pdf_url: str) -> str:
-    best_location = item.get("best_oa_location") or {}
-    primary_location = item.get("primary_location") or {}
-    candidates = [
-        best_location.get("landing_page_url"),
-        primary_location.get("landing_page_url"),
-        item.get("doi"),
-        item.get("id"),
-        pdf_url,
-    ]
+def build_arxiv_pdf_url(arxiv_id: str) -> str:
+    value = extract_arxiv_id(arxiv_id)
+    return f"https://arxiv.org/pdf/{value}.pdf" if value else ""
+
+
+def pick_openalex_pdf_url(item: Dict[str, Any], arxiv_id: str = "") -> str:
+    for candidate in sorted(collect_openalex_pdf_candidates(item, arxiv_id), key=openalex_pdf_candidate_priority):
+        url = normalize_spaces(candidate.get("url"))
+        if str(candidate.get("kind") or "").strip().lower() == "direct_pdf" and looks_like_probable_pdf_url(url):
+            return url
+    return build_arxiv_pdf_url(arxiv_id)
+
+
+def pick_openalex_external_url(item: Dict[str, Any], pdf_url: str, arxiv_id: str = "") -> str:
+    candidates: List[Any] = []
+    for candidate in collect_openalex_pdf_candidates(item, arxiv_id):
+        if str(candidate.get("kind") or "").strip().lower() == "landing_page":
+            candidates.append(candidate.get("url"))
+    if arxiv_id:
+        candidates.append(f"https://arxiv.org/abs/{arxiv_id}")
+    candidates.extend([item.get("doi"), item.get("id"), pdf_url])
     for candidate in candidates:
         url = normalize_spaces(candidate)
         if url:
             return url
     return ""
+
+
+def resolve_pdf_reason(pdf_url: str, external_url: str = "", *, local: bool = False, pmcid: str = "") -> Dict[str, str]:
+    if local:
+        return {"pdf_reason_code": "ready_local", "pdf_reason_message": "本地 PDF 已就绪"}
+    if str(pmcid or "").strip().upper().startswith("PMC"):
+        return {"pdf_reason_code": "needs_pmc_resolution", "pdf_reason_message": "正在准备 PDF…可稍后打开"}
+    if pdf_url:
+        return {"pdf_reason_code": "ready_remote", "pdf_reason_message": "已发现可缓存 PDF"}
+    if external_url:
+        return {"pdf_reason_code": "landing_page_only", "pdf_reason_message": "源站仅提供论文落地页，未发现可用 PDF"}
+    return {"pdf_reason_code": "no_open_access_pdf", "pdf_reason_message": "源站未提供可用 PDF"}
 
 
 def fetch_pmc_oa_package_url(pmcid: str) -> str:
@@ -1155,13 +1362,24 @@ def normalize_arxiv_result(item: Dict[str, Any]) -> Dict[str, Any]:
         "openalex_id": "",
         "europepmc_id": "",
         "europepmc_source": "",
+        "pmcid": "",
         "doi": normalize_doi(item.get("doi")),
         "pdf_url": pdf_url,
         "external_url": src_url,
         "src_url": src_url,
+        "pdf_candidates": [
+            candidate
+            for candidate in [
+                build_pdf_candidate(pdf_url, "direct_pdf", source="arxiv:pdf", label="arXiv"),
+                build_pdf_candidate(f"https://arxiv.org/abs/{arxiv_id}", "landing_page", source="arxiv:abs", label="arXiv") if arxiv_id else None,
+            ]
+            if candidate
+        ],
+        "explicit_arxiv_id": bool(arxiv_id),
         "publish_at": item.get("publish_at") or item.get("published_at") or "",
         "citation": item.get("citation") or item.get("citations") or 0,
         "supports_favorite": bool(arxiv_id),
+        **resolve_pdf_reason(pdf_url, src_url),
     }
 
 
@@ -1175,14 +1393,19 @@ def normalize_openalex_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for authorship in (item.get("authorships") or [])
         if isinstance(authorship, dict)
     ]
-    pdf_url = pick_openalex_pdf_url(item)
-    src_url = pick_openalex_external_url(item, pdf_url)
+    explicit_arxiv_id = pick_openalex_arxiv_id(item)
+    pdf_candidates = collect_openalex_pdf_candidates(item, explicit_arxiv_id)
+    pdf_url = pick_openalex_pdf_url(item, explicit_arxiv_id)
+    src_url = pick_openalex_external_url(item, pdf_url, explicit_arxiv_id)
     publish_at = str(item.get("publication_date") or "").strip()
     if not publish_at and item.get("publication_year"):
         publish_at = f"{item['publication_year']}-01-01"
     doi = normalize_doi(item.get("doi") or item.get("ids", {}).get("doi"))
     abstract_text = reconstruct_openalex_abstract(item.get("abstract_inverted_index"))
-    arxiv_id = extract_arxiv_id(str(item.get("ids", {}).get("arxiv") or "")) or extract_arxiv_id(pdf_url) or extract_arxiv_id(src_url)
+    arxiv_id = explicit_arxiv_id
+    open_access = item.get("open_access") or {}
+    has_content = item.get("has_content") or {}
+    content_urls = item.get("content_urls") or {}
     return {
         **item,
         "paper_key": build_paper_key("openalex", openalex_id or doi, title),
@@ -1196,12 +1419,21 @@ def normalize_openalex_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "openalex_id": openalex_id,
         "europepmc_id": "",
         "europepmc_source": "",
+        "pmcid": "",
         "doi": doi,
         "pdf_url": pdf_url,
         "external_url": src_url,
         "src_url": src_url,
+        "pdf_candidates": pdf_candidates,
+        "openalex_content_url": normalize_spaces(content_urls.get("pdf") or item.get("content_url")),
+        "openalex_oa_url": normalize_spaces(open_access.get("oa_url")),
+        "openalex_is_oa": bool(open_access.get("is_oa")),
+        "openalex_oa_status": normalize_spaces(open_access.get("oa_status")),
+        "openalex_has_content_pdf": bool(has_content.get("pdf")),
+        "explicit_arxiv_id": bool(explicit_arxiv_id),
         "citation": item.get("cited_by_count") or 0,
         "supports_favorite": False,
+        **resolve_pdf_reason(pdf_url, src_url),
     }
 
 
@@ -1218,6 +1450,15 @@ def normalize_europepmc_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]
     pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/" if pmcid else ""
     landing_url = f"https://europepmc.org/article/{source_code}/{europepmc_id}" if source_code and europepmc_id else ""
     doi = normalize_doi(item.get("doi"))
+    pdf_candidates = [
+        candidate
+        for candidate in [
+            build_pdf_candidate(pdf_url, "direct_pdf", source="europepmc:pmc_pdf", label="PMC") if pmcid else None,
+            build_pdf_candidate(landing_url, "landing_page", source="europepmc:landing", label="Europe PMC") if landing_url else None,
+            build_pdf_candidate(doi, "landing_page", source="europepmc:doi", label="DOI") if doi else None,
+        ]
+        if candidate
+    ]
     return {
         **item,
         "paper_key": build_paper_key(meta["source_kind"], europepmc_id or doi, title),
@@ -1236,15 +1477,84 @@ def normalize_europepmc_result(item: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "pdf_url": pdf_url,
         "external_url": landing_url,
         "src_url": landing_url,
+        "pdf_candidates": pdf_candidates,
+        "explicit_arxiv_id": False,
         "citation": item.get("citedByCount") or 0,
         "supports_favorite": False,
+        **resolve_pdf_reason(pdf_url, landing_url, pmcid=pmcid),
     }
 
 
-def merge_results(items: List[Dict[str, Any]], limit: int, max_per_group: Optional[int] = None) -> List[Dict[str, Any]]:
+def build_arxiv_preferred_record(item: Dict[str, Any]) -> Dict[str, Any]:
+    source_kind = str(item.get("source_kind") or "").strip().lower()
+    arxiv_id = extract_arxiv_id(str(item.get("arxiv_id") or ""))
+    if source_kind == "arxiv" or not arxiv_id or item.get("explicit_arxiv_id") is not True:
+        return item
+
+    title = str(item.get("title") or arxiv_id or "Untitled").strip()
+    paper_key = build_paper_key("arxiv", arxiv_id, title)
+    pdf_url = build_arxiv_pdf_url(arxiv_id)
+    external_url = f"https://arxiv.org/abs/{arxiv_id}"
+    pdf_candidates: List[Dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+
+    append_unique_pdf_candidate(
+        pdf_candidates,
+        seen_candidates,
+        build_pdf_candidate(pdf_url, "direct_pdf", source="arxiv:pdf", label="arXiv"),
+    )
+    append_unique_pdf_candidate(
+        pdf_candidates,
+        seen_candidates,
+        build_pdf_candidate(external_url, "landing_page", source="arxiv:abs", label="arXiv"),
+    )
+    for candidate in item.get("pdf_candidates") or []:
+        if isinstance(candidate, dict):
+            append_unique_pdf_candidate(pdf_candidates, seen_candidates, candidate)
+
+    return {
+        **item,
+        "paper_key": paper_key,
+        "favorite_key": paper_key,
+        "source_kind": "arxiv",
+        "source_label": "arXiv",
+        "pdf_url": pdf_url,
+        "external_url": external_url,
+        "src_url": external_url,
+        "pdf_candidates": pdf_candidates,
+        "supports_favorite": True,
+        **resolve_pdf_reason(pdf_url, external_url),
+    }
+
+
+def merge_candidate_priority(item: Dict[str, Any], *, prefer_arxiv_display: bool = False) -> tuple:
+    source_kind = str(item.get("source_kind") or "").strip().lower()
+    arxiv_id = extract_arxiv_id(str(item.get("arxiv_id") or ""))
+    if source_kind == "arxiv":
+        source_rank = 0
+    elif prefer_arxiv_display and arxiv_id and item.get("explicit_arxiv_id") is True:
+        source_rank = 1
+    else:
+        source_rank = 10 + SOURCE_PRIORITY.get(source_kind or "europepmc", 99)
+    return (
+        source_rank,
+        -parse_publish_time(item.get("publish_at")),
+        str(item.get("title") or "").lower(),
+    )
+
+
+def merge_results(
+    items: List[Dict[str, Any]],
+    limit: int,
+    max_per_group: Optional[int] = None,
+    *,
+    prefer_arxiv_display: bool = False,
+) -> List[Dict[str, Any]]:
     merged: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    for item in items:
+    ranked_items = sorted(items, key=lambda item: merge_candidate_priority(item, prefer_arxiv_display=prefer_arxiv_display))
+    for raw_item in ranked_items:
+        item = build_arxiv_preferred_record(raw_item) if prefer_arxiv_display else raw_item
         keys = paper_identity_aliases(item)
         if not keys or any(key in seen for key in keys):
             continue
@@ -1382,7 +1692,7 @@ def cmd_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    merged = merge_results(results, limit, max_per_group=max(2, (limit + 1) // 2))
+    merged = merge_results(results, limit, max_per_group=max(2, (limit + 1) // 2), prefer_arxiv_display=True)
     return {"total": len(merged), "results": merged}
 
 
