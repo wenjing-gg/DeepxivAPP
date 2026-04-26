@@ -1,6 +1,6 @@
 {
   "name": "deepxiv-client",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "DeepXiv cross-platform desktop client built with Electron and the official Python SDK",
   "author": "wenjing-gg",
   "repository": {

@@ -45,6 +45,8 @@ body,
 #root {
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   margin: 0;
   padding: 0;
   overflow: hidden;
@@ -87,6 +89,8 @@ textarea {
   grid-template-columns: 276px minmax(0, 1fr);
   gap: 18px;
   height: 100vh;
+  height: 100dvh;
+  min-height: 0;
   padding: 18px;
   overflow: hidden;
 }
@@ -94,6 +98,7 @@ textarea {
 .onboarding-shell {
   position: relative;
   min-height: 100vh;
+  min-height: 100dvh;
   padding: 18px;
   overflow: auto;
 }
@@ -107,6 +112,7 @@ textarea {
   align-content: center;
   gap: 18px;
   min-height: calc(100vh - 36px);
+  min-height: calc(100dvh - 36px);
 }
 
 .onboarding-panel {
@@ -325,6 +331,9 @@ textarea {
   padding: 16px;
   border-radius: 30px;
   min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .window-controls {
@@ -773,21 +782,21 @@ textarea {
 .toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 14px;
   border-radius: var(--radius-lg);
 }
 
 .search-query-input {
-  flex: 1 1 620px;
-  min-width: 360px;
+  flex: 999 1 420px;
+  min-width: 240px;
 }
 
 .search-source-select {
-  flex: 0 0 176px;
-  width: 176px;
-  min-width: 176px;
+  flex: 1 1 176px;
+  width: auto;
+  min-width: 148px;
 }
 
 .mode-hint {
@@ -821,6 +830,8 @@ textarea {
 
 .input.small {
   width: 96px;
+  min-width: 88px;
+  flex: 0 0 96px;
 }
 
 .select {
@@ -877,6 +888,10 @@ textarea {
 .settings-grid {
   display: grid;
   gap: 14px;
+  flex: 1 1 auto;
+  min-height: 0;
+  align-content: start;
+  overflow: auto;
 }
 
 .settings-grid-wide {
@@ -889,6 +904,7 @@ textarea {
 .library-column {
   min-height: 0;
   overflow: hidden;
+  min-width: 0;
 }
 
 .list-panel,
@@ -1144,6 +1160,8 @@ textarea {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .group-chip {
@@ -1209,6 +1227,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  overflow: auto;
 }
 
 .settings-card h3 {
@@ -1501,6 +1520,7 @@ textarea {
   flex: 1 1 auto;
   align-self: stretch;
   min-height: 0;
+  min-width: 0;
   margin: 12px 16px 16px;
   height: auto;
   max-height: none;
@@ -1754,11 +1774,87 @@ textarea {
   }
 }
 
+@media (max-width: 1360px), (max-height: 900px) {
+  .app-shell {
+    padding: 14px;
+    gap: 14px;
+  }
+
+  .sidebar {
+    gap: 14px;
+    padding: 14px;
+  }
+
+  .topbar {
+    padding: 20px 22px;
+  }
+
+  .topbar h2 {
+    font-size: 30px;
+  }
+
+  .page-header-copy h2 {
+    font-size: 24px;
+  }
+
+  .detail-title {
+    font-size: 16px;
+  }
+
+  .token-card,
+  .settings-card,
+  .result-item {
+    padding: 14px;
+  }
+}
+
+@media (max-width: 1240px), (max-height: 820px) {
+  .app-shell {
+    grid-template-columns: 228px minmax(0, 1fr);
+  }
+
+  .split-layout {
+    grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  }
+
+  .library-layout {
+    grid-template-columns: 260px 260px minmax(0, 1fr);
+  }
+
+  .topbar,
+  .page-header-plain,
+  .favorite-groups-toolbar,
+  .favorite-group-editor,
+  .favorite-group-create,
+  .favorite-group-rename,
+  .btn-row,
+  .detail-actions,
+  .section-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .topbar-status,
+  .page-header-status {
+    min-width: 0;
+  }
+
+  .status-pill {
+    width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+  }
+
+  .search-query-input {
+    flex-basis: 100%;
+  }
+}
+
 @media (max-width: 1120px) {
   .app-shell {
     grid-template-columns: 1fr;
     height: auto;
     min-height: 100vh;
+    min-height: 100dvh;
     overflow: auto;
   }
 
@@ -1878,6 +1974,11 @@ textarea {
     flex: 1 1 auto;
   }
 
+  .input.small {
+    width: 100%;
+    flex: 1 1 auto;
+  }
+
   .topbar h2 {
     font-size: 26px;
   }
@@ -1901,5 +2002,38 @@ textarea {
 
   .form-field-wide {
     grid-column: auto;
+  }
+}
+
+@media (max-height: 760px) {
+  .app-shell {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .brand-copy h1 {
+    font-size: 24px;
+  }
+
+  .brand-copy p,
+  .nav-subtitle,
+  .topbar p,
+  .page-header-copy p {
+    font-size: 12px;
+  }
+
+  .token-state,
+  .settings-status-label,
+  .sidebar-footer-label {
+    font-size: 16px;
+  }
+
+  .toolbar,
+  .favorite-groups-panel,
+  .detail-header,
+  .ai-chat-header,
+  .ai-chat-footer {
+    padding-top: 12px;
+    padding-bottom: 12px;
   }
 }
