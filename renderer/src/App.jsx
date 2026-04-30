@@ -2143,6 +2143,32 @@ export default function App() {
           : `${tokenStatusLabel} · ${aiStatusLabel}`
   );
 
+  function renderContextAiPanel(context, emptyText) {
+    const viewer = embeddedPdf[context];
+    const contextSnapshot = snapshots[context];
+    const contextPaper = activePaper[context] || (viewer?.payload ? normalizePaper(viewer.payload) : null);
+    const effectiveSnapshot = contextSnapshot || (contextPaper ? makeExternalSnapshot(contextPaper) : null);
+
+    if (!effectiveSnapshot) {
+      return <EmptyState text={emptyText} />;
+    }
+
+    return (
+      <AIChatPanel
+        snapshot={effectiveSnapshot}
+        paper={contextPaper}
+        pdfStatus={getPdfStatus(effectiveSnapshot, contextPaper)}
+        pdfViewerState={getPdfViewerState(effectiveSnapshot, contextPaper)}
+        embeddedPdf={viewer}
+        aiConfig={aiConfig}
+        aiConfigStatus={aiConfigStatus}
+        onAskAI={handleAskAI}
+        messages={getAiConversationMessages(effectiveSnapshot, contextPaper)}
+        onMessagesChange={(messages) => setAiConversationMessages(effectiveSnapshot, contextPaper, messages)}
+      />
+    );
+  }
+
   if (showOnboarding) {
     return (
       <OnboardingView
@@ -2269,15 +2295,17 @@ export default function App() {
             </div>
             <div className="mode-hint">{selectedSearchSource.label}：{selectedSearchSource.help}</div>
             <div className="split-layout">
-              <div className="card list-panel">
-                <ResultList
-                  items={searchResults}
-                  activeId={activePaper.search?.paper_key}
-                  onSelect={(paper) => openPaper('search', paper)}
-                  isLoading={isSearching}
-                  loadingText="正在搜索论文..."
-                  emptyText="暂无结果"
-                />
+              <div className={`card list-panel ${embeddedPdf.search?.target ? 'ai-list-panel' : ''}`}>
+                {embeddedPdf.search?.target ? renderContextAiPanel('search', '请选择一篇论文。') : (
+                  <ResultList
+                    items={searchResults}
+                    activeId={activePaper.search?.paper_key}
+                    onSelect={(paper) => openPaper('search', paper)}
+                    isLoading={isSearching}
+                    loadingText="正在搜索论文..."
+                    emptyText="暂无结果"
+                  />
+                )}
               </div>
               <div className="card detail-panel">
                 <DetailView
@@ -2308,102 +2336,104 @@ export default function App() {
         {page === 'library' && (
           <section className="page active">
             <div className="split-layout">
-              <div className="card list-panel">
-                <div className="favorites-shell">
-                  <div className="favorite-groups-panel">
-                    <div className="favorite-groups-toolbar">
-                      <div className="favorite-groups-row">
-                        <button className={`group-chip ${activeGroupId === 'all' ? 'active' : ''}`} onClick={() => setActiveGroupId('all')}>
-                          全部
-                          <span>{favoriteGroupCounts.all || 0}</span>
-                        </button>
-                        {favoriteGroups.map((group) => (
-                          editingGroupId === group.id ? (
+              <div className={`card list-panel ${embeddedPdf.library?.target ? 'ai-list-panel' : ''}`}>
+                {embeddedPdf.library?.target ? renderContextAiPanel('library', '请选择一篇收藏论文。') : (
+                  <div className="favorites-shell">
+                    <div className="favorite-groups-panel">
+                      <div className="favorite-groups-toolbar">
+                        <div className="favorite-groups-row">
+                          <button className={`group-chip ${activeGroupId === 'all' ? 'active' : ''}`} onClick={() => setActiveGroupId('all')}>
+                            全部
+                            <span>{favoriteGroupCounts.all || 0}</span>
+                          </button>
+                          {favoriteGroups.map((group) => (
+                            editingGroupId === group.id ? (
+                              <input
+                                key={group.id}
+                                className="input group-chip-input"
+                                autoFocus
+                                value={editingGroupName}
+                                onChange={(event) => setEditingGroupName(event.target.value)}
+                                onBlur={() => handleRenameFavoriteGroup(group.id)}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') {
+                                    handleRenameFavoriteGroup(group.id);
+                                  }
+                                  if (event.key === 'Escape') {
+                                    handleCancelRenameGroup();
+                                  }
+                                }}
+                              />
+                            ) : (
+                              <button
+                                key={group.id}
+                                className={`group-chip ${activeGroupId === group.id ? 'active' : ''}`}
+                                onClick={() => setActiveGroupId(group.id)}
+                                onDoubleClick={() => handleStartRenameGroup(group)}
+                              >
+                                {group.name}
+                                <span>{favoriteGroupCounts[group.id] || 0}</span>
+                              </button>
+                            )
+                          ))}
+                        </div>
+                        <div className="favorite-groups-actions">
+                          <button className="btn primary import-pdf-btn" onClick={handleImportLocalPdf}>批量导入 PDF</button>
+                          <button className="btn group-create-btn" onClick={handleCreateFavoriteGroup}>{showGroupCreator ? '确认创建' : '新建分组'}</button>
+                        </div>
+                      </div>
+                      {showGroupCreator && (
+                        <div className="favorite-group-editor">
+                          <div className="favorite-group-create">
                             <input
-                              key={group.id}
-                              className="input group-chip-input"
+                              className="input"
                               autoFocus
-                              value={editingGroupName}
-                              onChange={(event) => setEditingGroupName(event.target.value)}
-                              onBlur={() => handleRenameFavoriteGroup(group.id)}
+                              placeholder="输入新分组名称"
+                              value={newGroupName}
+                              onChange={(event) => setNewGroupName(event.target.value)}
                               onKeyDown={(event) => {
                                 if (event.key === 'Enter') {
-                                  handleRenameFavoriteGroup(group.id);
+                                  handleCreateFavoriteGroup();
                                 }
                                 if (event.key === 'Escape') {
-                                  handleCancelRenameGroup();
+                                  setShowGroupCreator(false);
+                                  setNewGroupName('');
                                 }
                               }}
                             />
-                          ) : (
-                            <button
-                              key={group.id}
-                              className={`group-chip ${activeGroupId === group.id ? 'active' : ''}`}
-                              onClick={() => setActiveGroupId(group.id)}
-                              onDoubleClick={() => handleStartRenameGroup(group)}
-                            >
-                              {group.name}
-                              <span>{favoriteGroupCounts[group.id] || 0}</span>
-                            </button>
-                          )
-                        ))}
-                      </div>
-                      <div className="favorite-groups-actions">
-                        <button className="btn primary import-pdf-btn" onClick={handleImportLocalPdf}>批量导入 PDF</button>
-                        <button className="btn group-create-btn" onClick={handleCreateFavoriteGroup}>{showGroupCreator ? '确认创建' : '新建分组'}</button>
-                      </div>
-                    </div>
-                    {showGroupCreator && (
-                      <div className="favorite-group-editor">
-                        <div className="favorite-group-create">
-                          <input
-                            className="input"
-                            autoFocus
-                            placeholder="输入新分组名称"
-                            value={newGroupName}
-                            onChange={(event) => setNewGroupName(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter') {
-                                handleCreateFavoriteGroup();
-                              }
-                              if (event.key === 'Escape') {
-                                setShowGroupCreator(false);
-                                setNewGroupName('');
-                              }
-                            }}
-                          />
-                          <button className="btn" onClick={() => { setShowGroupCreator(false); setNewGroupName(''); }}>取消</button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  {visibleFavorites.length ? (
-                    <div className="result-list">
-                      {visibleFavorites.map((paper) => {
-                        const favoriteKey = getFavoriteKey(paper);
-                        const meta = [paper.author_line || '', paper.publish_at || '', paper.source_label || ''].filter(Boolean).join(' · ');
-                        return (
-                          <div key={favoriteKey || paper.paper_key} className={`result-item ${getFavoriteKey(activePaper.library) === favoriteKey ? 'active' : ''}`}>
-                            <button className="result-button" onClick={() => openPaper('library', paper)}>
-                              <div className="result-title">
-                                <TitleWithSource title={paper.title || favoriteKey || 'Untitled'} sourceKind={paper.source_kind} sourceLabel={paper.source_label} />
-                              </div>
-                              <div className="result-meta">{meta || '暂无信息'}</div>
-                            </button>
-                            <div className="favorite-item-actions">
-                              <select className="select favorite-group-select" value={paper.group_id || defaultFavoriteGroupId} onChange={(event) => handleSetFavoriteGroup(favoriteKey, event.target.value)}>
-                                {favoriteGroups.map((group) => (
-                                  <option key={group.id} value={group.id}>{group.name}</option>
-                                ))}
-                              </select>
-                              <button className="mini-btn" onClick={() => handleRemoveFavorite(favoriteKey)}>移除</button>
-                            </div>
+                            <button className="btn" onClick={() => { setShowGroupCreator(false); setNewGroupName(''); }}>取消</button>
                           </div>
-                        );
-                      })}
+                        </div>
+                      )}
                     </div>
-                  ) : <EmptyState text={favorites.length ? '当前分组暂无论文。' : '暂无收藏，可先导入本地 PDF 或收藏搜索结果。'} />}
-                </div>
+                    {visibleFavorites.length ? (
+                      <div className="result-list">
+                        {visibleFavorites.map((paper) => {
+                          const favoriteKey = getFavoriteKey(paper);
+                          const meta = [paper.author_line || '', paper.publish_at || '', paper.source_label || ''].filter(Boolean).join(' · ');
+                          return (
+                            <div key={favoriteKey || paper.paper_key} className={`result-item ${getFavoriteKey(activePaper.library) === favoriteKey ? 'active' : ''}`}>
+                              <button className="result-button" onClick={() => openPaper('library', paper)}>
+                                <div className="result-title">
+                                  <TitleWithSource title={paper.title || favoriteKey || 'Untitled'} sourceKind={paper.source_kind} sourceLabel={paper.source_label} />
+                                </div>
+                                <div className="result-meta">{meta || '暂无信息'}</div>
+                              </button>
+                              <div className="favorite-item-actions">
+                                <select className="select favorite-group-select" value={paper.group_id || defaultFavoriteGroupId} onChange={(event) => handleSetFavoriteGroup(favoriteKey, event.target.value)}>
+                                  {favoriteGroups.map((group) => (
+                                    <option key={group.id} value={group.id}>{group.name}</option>
+                                  ))}
+                                </select>
+                                <button className="mini-btn" onClick={() => handleRemoveFavorite(favoriteKey)}>移除</button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : <EmptyState text={favorites.length ? '当前分组暂无论文。' : '暂无收藏，可先导入本地 PDF 或收藏搜索结果。'} />}
+                  </div>
+                )}
               </div>
 
               <div className="card detail-panel">
@@ -2435,8 +2465,10 @@ export default function App() {
         {page === 'history' && (
           <section className="page active">
             <div className="split-layout">
-              <div className="card list-panel">
-                <HistoryList items={history} activeKey={activeHistoryKey} onSelect={handleOpenHistory} emptyText="暂无记录" />
+              <div className={`card list-panel ${embeddedPdf.history?.target ? 'ai-list-panel' : ''}`}>
+                {embeddedPdf.history?.target ? renderContextAiPanel('history', '请选择一篇最近访问的论文。') : (
+                  <HistoryList items={history} activeKey={activeHistoryKey} onSelect={handleOpenHistory} emptyText="暂无记录" />
+                )}
               </div>
               <div className="card detail-panel">
                 <DetailView

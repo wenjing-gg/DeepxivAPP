@@ -913,6 +913,11 @@ textarea {
   flex-direction: column;
 }
 
+.list-panel.ai-list-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
 .result-list {
   position: relative;
   display: flex;
@@ -1525,6 +1530,33 @@ textarea {
   height: auto;
   max-height: none;
   resize: vertical;
+}
+
+.list-panel.ai-list-panel .ai-chat-panel.inline {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  border: none;
+  border-radius: inherit;
+  box-shadow: none;
+  resize: none;
+}
+
+.list-panel.ai-list-panel .ai-chat-header {
+  padding: 14px 14px 8px;
+}
+
+.list-panel.ai-list-panel .ai-chat-context {
+  padding: 10px 14px 0;
+}
+
+.list-panel.ai-list-panel .ai-chat-messages {
+  padding: 12px 14px;
+}
+
+.list-panel.ai-list-panel .ai-chat-footer {
+  padding: 12px 14px 14px;
 }
 
 .ai-chat-header {
