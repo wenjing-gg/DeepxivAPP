@@ -73,6 +73,42 @@ npm run dist:win
 - macOS：`dmg`
 - Windows：`exe` 安装包
 
+## macOS 签名与公证
+
+macOS 正式分发需要 Apple Developer ID 签名与 notarization，否则从浏览器下载的 `dmg` 可能会被 Gatekeeper 显示为“已损坏”。
+
+本项目已经接入 electron-builder 的 macOS 签名与公证流程。通过 tag 触发 GitHub Actions 前，需要先在仓库 Secrets 中配置：
+
+- `CSC_LINK`：Developer ID Application 证书导出的 `.p12` 文件内容，建议用 base64 后填入
+- `CSC_KEY_PASSWORD`：导出 `.p12` 时设置的密码
+- `APPLE_API_KEY_B64`：App Store Connect API Key `.p8` 文件内容，base64 后填入
+- `APPLE_API_KEY_ID`：App Store Connect API Key 的 Key ID
+- `APPLE_API_ISSUER`：App Store Connect API 的 Issuer ID
+
+证书获取路径：
+
+1. 加入 Apple Developer Program。
+2. 在 Apple Developer 后台创建 `Developer ID Application` 证书。
+3. 在 macOS Keychain Access 中导入证书后，连同私钥导出为 `.p12`。
+4. 用下面命令得到 `CSC_LINK`：
+
+```bash
+base64 -i DeveloperIDApplication.p12 | tr -d '\n'
+```
+
+App Store Connect API Key 获取路径：
+
+1. 进入 App Store Connect 的 Users and Access。
+2. 在 Integrations / API Keys 中创建密钥并下载 `AuthKey_*.p8`。
+3. 记录 Key ID 与 Issuer ID。
+4. 用下面命令得到 `APPLE_API_KEY_B64`：
+
+```bash
+base64 -i AuthKey_XXXXXXXXXX.p8 | tr -d '\n'
+```
+
+配置 Secrets 后，再推送新的 `v*` tag，Actions 会自动产出已签名并公证的 macOS `dmg`。
+
 ## 发布说明
 
 - 仓库不会内置任何真实 `OPENAI_API_KEY`

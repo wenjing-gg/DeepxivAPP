@@ -27,6 +27,17 @@ jobs:
             artifact_name: win-release
 
     runs-on: ${{ matrix.os }}
+    env:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_API_KEY_B64: ${{ secrets.APPLE_API_KEY_B64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_KEYCHAIN: ${{ secrets.APPLE_KEYCHAIN }}
+      APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
 
     steps:
       - name: Checkout
@@ -45,6 +56,10 @@ jobs:
 
       - name: Install Node dependencies
         run: npm ci
+
+      - name: Prepare macOS signing credentials
+        if: runner.os == 'macOS'
+        run: npm run mac:signing-env
 
       - name: Create Python venv (macOS)
         if: runner.os != 'Windows'

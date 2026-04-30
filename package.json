@@ -15,6 +15,7 @@
     "renderer:dev": "vite --config renderer/vite.config.js",
     "renderer:build": "vite build --config renderer/vite.config.js",
     "bridge:build": "node scripts/build_bridge.js",
+    "mac:signing-env": "node scripts/prepare_macos_signing_env.js",
     "test:ai-network": "node scripts/test_ai_network.js",
     "build:mac": "npm run bridge:build && npm run renderer:build && electron-builder --mac dir",
     "dist:mac": "npm run bridge:build && npm run renderer:build && electron-builder --mac dmg --publish never",
@@ -43,9 +44,11 @@
       }
     ],
     "mac": {
-      "identity": null,
-      "hardenedRuntime": false,
+      "hardenedRuntime": true,
       "gatekeeperAssess": false,
+      "notarize": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
       "target": [
         "dmg"
       ],
