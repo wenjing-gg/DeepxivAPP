@@ -23,7 +23,7 @@ HTTP_TIMEOUT = 30
 
 def fetch_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     query = urllib.parse.urlencode(params)
-    request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "DeepXiv-Mac-Client/1.0"})
+    request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "OhMyPaper/1.0"})
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
 

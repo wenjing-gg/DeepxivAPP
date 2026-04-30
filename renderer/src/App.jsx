@@ -114,7 +114,7 @@ const PAGE_META = {
   search: { title: '论文搜索', subtitle: '搜索论文并进行渐进式阅读' },
   library: { title: '收藏', subtitle: '管理收藏论文' },
   history: { title: '最近访问', subtitle: '查看最近打开的论文' },
-  settings: { title: '设置', subtitle: '配置 DeepXiv Token 与 AI 助手' }
+  settings: { title: '设置', subtitle: '配置连接 Token 与 AI 助手' }
 };
 
 const PAGE_DECOR = {
@@ -197,7 +197,8 @@ const DEFAULT_AI_CONFIG = {
   },
 };
 
-const AI_CHAT_STORAGE_KEY = 'deepxiv-ai-chat-histories-v1';
+const AI_CHAT_STORAGE_KEY = 'ohmypaper-ai-chat-histories-v1';
+const LEGACY_AI_CHAT_STORAGE_KEYS = ['deepxiv-ai-chat-histories-v1'];
 
 function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
   if (aiConfig.provider.requiresOpenAIAuth && !aiConfig.openAIApiKey) {
@@ -377,7 +378,10 @@ function normalizeAiConversationMessages(messages) {
 function loadAiChatStore() {
   if (typeof window === 'undefined' || !window.localStorage) return {};
   try {
-    const raw = JSON.parse(window.localStorage.getItem(AI_CHAT_STORAGE_KEY) || '{}');
+    const stored = window.localStorage.getItem(AI_CHAT_STORAGE_KEY)
+      || LEGACY_AI_CHAT_STORAGE_KEYS.map((key) => window.localStorage.getItem(key)).find(Boolean)
+      || '{}';
+    const raw = JSON.parse(stored);
     return Object.fromEntries(
       Object.entries(raw || {})
         .map(([key, messages]) => [String(key || '').trim(), normalizeAiConversationMessages(messages)])
@@ -1264,9 +1268,9 @@ function OnboardingView({
         <section className="card onboarding-panel onboarding-panel-minimal">
           <div className="onboarding-panel-header">
             <div className="brand onboarding-brand">
-              <div className="brand-mark">DX</div>
+              <div className="brand-mark">OM</div>
               <div className="brand-copy">
-                <h1>DeepXiv</h1>
+                <h1>OhMyPaper</h1>
                 <p>自动连接后即可开始</p>
               </div>
             </div>
@@ -1344,7 +1348,7 @@ function OnboardingView({
           <div className="onboarding-footer">
             <div className="btn-row">
               <button className="btn" onClick={onToggleAiForm}>{shouldShowAiForm ? '稍后配置' : '配置 AI'}</button>
-              <button className="btn primary" disabled={!canContinue} onClick={onContinue}>进入 DeepXiv</button>
+              <button className="btn primary" disabled={!canContinue} onClick={onContinue}>进入 OhMyPaper</button>
             </div>
           </div>
         </section>
@@ -1363,7 +1367,7 @@ export default function App() {
   const [isInitializing, setIsInitializing] = useState(true);
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [isAutoRegistering, setIsAutoRegistering] = useState(false);
-  const [onboardingMessage, setOnboardingMessage] = useState('正在准备 DeepXiv…');
+  const [onboardingMessage, setOnboardingMessage] = useState('正在准备 OhMyPaper…');
   const [showOnboardingAiForm, setShowOnboardingAiForm] = useState(false);
   const [isSavingAiConfig, setIsSavingAiConfig] = useState(false);
   const [token, setToken] = useState(null);
@@ -1440,7 +1444,7 @@ export default function App() {
   }
 
   async function refreshBootstrap(options = {}) {
-    const bootstrap = await window.deepxiv.bootstrap();
+    const bootstrap = await window.ohMyPaper.bootstrap();
     applyBootstrapData(bootstrap, options);
     return bootstrap;
   }
@@ -1453,7 +1457,7 @@ export default function App() {
       setStatusText('正在匿名注册…');
     }
     try {
-      const nextToken = await window.deepxiv.registerToken();
+      const nextToken = await window.ohMyPaper.registerToken();
       setToken(nextToken);
       setTokenInput(nextToken?.token || '');
       setOnboardingMessage('已自动完成匿名注册，可以直接开始使用。');
@@ -1475,11 +1479,11 @@ export default function App() {
 
   async function initializeApp() {
     setIsInitializing(true);
-    setOnboardingMessage('正在准备 DeepXiv…');
+    setOnboardingMessage('正在准备 OhMyPaper…');
     try {
       const bootstrap = await refreshBootstrap();
       if (bootstrap.token?.has_token) {
-        setOnboardingMessage('已自动连接 DeepXiv，可按需配置 AI 后进入软件。');
+        setOnboardingMessage('已自动连接 OhMyPaper，可按需配置 AI 后进入软件。');
       } else {
         await performAnonymousRegistration({ silentStatus: true }).catch(() => {});
       }
@@ -1495,7 +1499,7 @@ export default function App() {
   async function handleRefreshStatus() {
     setStatusText('正在刷新状态…');
     try {
-      const result = await window.deepxiv.refreshStatus();
+      const result = await window.ohMyPaper.refreshStatus();
       setToken(result.token || null);
       const nextAiConfig = normalizeAiConfig(result.aiConfig || aiConfig);
       setAiConfig(nextAiConfig);
@@ -1541,7 +1545,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = window.deepxiv.onPdfPrefetchStatus?.((payload) => {
+    const unsubscribe = window.ohMyPaper.onPdfPrefetchStatus?.((payload) => {
       const status = normalizePdfPrefetchStatus(payload);
       if (!status.paperKey) return;
       setPdfPrefetchStore((prev) => {
@@ -1680,7 +1684,7 @@ export default function App() {
   async function prefetchPdfForPaper(snapshot, paper) {
     const payload = buildPdfPrefetchPayload(snapshot, paper);
     try {
-      return mergePdfPrefetchStatus(await window.deepxiv.prefetchPdf(payload));
+    return mergePdfPrefetchStatus(await window.ohMyPaper.prefetchPdf(payload));
     } catch (error) {
       return null;
     }
@@ -1688,7 +1692,7 @@ export default function App() {
 
   async function resolvePdfOpenForPaper(snapshot, paper) {
     const payload = buildPdfPrefetchPayload(snapshot, paper);
-    return mergePdfPrefetchStatus(await window.deepxiv.resolvePdf(payload));
+    return mergePdfPrefetchStatus(await window.ohMyPaper.resolvePdf(payload));
   }
 
   async function openPaper(context, rawPaper, options = {}) {
@@ -1721,7 +1725,7 @@ export default function App() {
     }
     try {
       if (canLoadSnapshot) {
-        const snapshot = await window.deepxiv.snapshot(buildSnapshotPayload(paper, options));
+        const snapshot = await window.ohMyPaper.snapshot(buildSnapshotPayload(paper, options));
         clearPdfResolveHint(context);
         if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
         activePaperKeyRef.current = { ...activePaperKeyRef.current, [context]: getPaperSessionKey(snapshot, paper) || previewPaperKey };
@@ -1732,7 +1736,7 @@ export default function App() {
           void prefetchPdfForPaper(snapshot, paper);
         }
         if (options.trackHistory !== false) {
-          const nextHistory = await window.deepxiv.historyList();
+          const nextHistory = await window.ohMyPaper.historyList();
           if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
           setHistory(nextHistory || []);
         }
@@ -1741,7 +1745,7 @@ export default function App() {
         if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
         setSnapshots((prev) => ({ ...prev, [context]: previewSnapshot }));
         if (options.trackHistory !== false) {
-          const nextHistory = await window.deepxiv.historyAdd({ kind: 'paper', payload: paper });
+          const nextHistory = await window.ohMyPaper.historyAdd({ kind: 'paper', payload: paper });
           if (!isLatestContextRequest(openPaperRequestRef, context, requestId)) return;
           setHistory(nextHistory || []);
         }
@@ -1777,7 +1781,7 @@ export default function App() {
     setIsSearching(true);
     setStatusText(showSearchLimit ? '正在搜索论文…' : '正在打开论文…');
     try {
-      const result = await window.deepxiv.search({ query, limit: Number(searchLimit), mode: searchMode, source_scope: searchSourceScope });
+      const result = await window.ohMyPaper.search({ query, limit: Number(searchLimit), mode: searchMode, source_scope: searchSourceScope });
       const papers = dedupePapers(sortPapersByTime((result.results || []).map(normalizePaper)));
       setSearchResults(papers);
       if (!papers[0]) {
@@ -1807,7 +1811,7 @@ export default function App() {
       group_id: activeGroupId !== 'all' ? activeGroupId : defaultFavoriteGroupId,
     });
     if (!getFavoriteKey(paper)) return;
-    const result = await window.deepxiv.favoritesToggle(paper);
+    const result = await window.ohMyPaper.favoritesToggle(paper);
     setFavorites((result.favorites || []).map(normalizePaper));
     setFavoriteGroups(result.favoriteGroups || favoriteGroups);
     if (context === 'library' && result?.isFavorite === false) {
@@ -1819,7 +1823,7 @@ export default function App() {
   async function handleImportLocalPdf() {
     setStatusText('正在导入本地 PDF…');
     try {
-      const result = await window.deepxiv.importLocalPdf({
+      const result = await window.ohMyPaper.importLocalPdf({
         groupId: activeGroupId !== 'all' ? activeGroupId : defaultFavoriteGroupId,
       });
       if (result?.canceled) {
@@ -1861,7 +1865,7 @@ export default function App() {
     if (!name) return;
     setStatusText('正在创建分组…');
     try {
-      const result = await window.deepxiv.createFavoriteGroup(name);
+      const result = await window.ohMyPaper.createFavoriteGroup(name);
       setFavoriteGroups(result.favoriteGroups || []);
       setNewGroupName('');
       setShowGroupCreator(false);
@@ -1890,7 +1894,7 @@ export default function App() {
     if (!name) return;
     setStatusText('正在重命名分组…');
     try {
-      const result = await window.deepxiv.renameFavoriteGroup({ groupId, name });
+      const result = await window.ohMyPaper.renameFavoriteGroup({ groupId, name });
       setFavoriteGroups(result.favoriteGroups || []);
       setEditingGroupId('');
       setEditingGroupName('');
@@ -1900,7 +1904,7 @@ export default function App() {
   }
 
   async function handleSetFavoriteGroup(favoriteKey, groupId) {
-    const result = await window.deepxiv.setFavoriteGroup({ favoriteKey, groupId });
+    const result = await window.ohMyPaper.setFavoriteGroup({ favoriteKey, groupId });
     setFavorites((result.favorites || []).map(normalizePaper));
     setFavoriteGroups(result.favoriteGroups || favoriteGroups);
   }
@@ -1908,7 +1912,7 @@ export default function App() {
   async function handleSaveToken() {
     setStatusText('正在保存 Token…');
     try {
-      const nextToken = await window.deepxiv.saveToken(tokenInput);
+      const nextToken = await window.ohMyPaper.saveToken(tokenInput);
       setToken(nextToken);
       setStatusText('Token 已保存');
     } catch (error) {
@@ -1930,7 +1934,7 @@ export default function App() {
       setStatusText('正在保存 AI 配置…');
     }
     try {
-      const saved = await window.deepxiv.saveAiConfig(nextConfig);
+      const saved = await window.ohMyPaper.saveAiConfig(nextConfig);
       const normalized = normalizeAiConfig(saved?.config || {});
       const nextStatus = normalizeAiConfigStatus(saved?.status, normalized);
       setAiConfig(normalized);
@@ -1999,7 +2003,7 @@ export default function App() {
   async function handleAskAI(payload) {
     setStatusText('AI 正在结合论文上下文思考…');
     try {
-      return await window.deepxiv.aiChat(payload);
+      return await window.ohMyPaper.aiChat(payload);
     } catch (error) {
       throw new Error(toUserErrorMessage(error, 'AI 请求失败'));
     } finally {
@@ -2008,7 +2012,7 @@ export default function App() {
   }
 
   async function handleRemoveFavorite(paperId) {
-    const result = await window.deepxiv.favoriteRemove(paperId);
+    const result = await window.ohMyPaper.favoriteRemove(paperId);
     setFavorites((result.favorites || []).map(normalizePaper));
     setFavoriteGroups(result.favoriteGroups || favoriteGroups);
     if (getFavoriteKey(activePaper.library) === paperId) {
@@ -2094,7 +2098,7 @@ export default function App() {
   }
 
   const loadEmbeddedPdfDocument = useCallback(async (payload) => {
-    return window.deepxiv.loadPdfDocument(payload);
+    return window.ohMyPaper.loadPdfDocument(payload);
   }, []);
 
   const handleSearchPdfViewerStateChange = useCallback((state) => {
@@ -2177,9 +2181,9 @@ export default function App() {
       <AppBackground />
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">DX</div>
+          <div className="brand-mark">OM</div>
           <div className="brand-copy">
-            <h1>DeepXiv</h1>
+            <h1>OhMyPaper</h1>
             <p>Desktop Client</p>
           </div>
         </div>
@@ -2190,7 +2194,7 @@ export default function App() {
             <div className="status-card-heading">账号连接</div>
             <div className="token-card-row">
               <div className="token-card-copy">
-                <div className="token-label">DeepXiv Token</div>
+                <div className="token-label">连接 Token</div>
                 <div className="token-state">{tokenStatusLabel}</div>
               </div>
               <div className={`token-indicator ${tokenIndicatorClass}`} title={token?.has_token ? 'Token 可用' : 'Token 未配置'}>{tokenIndicator}</div>

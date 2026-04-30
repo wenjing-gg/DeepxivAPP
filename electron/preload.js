@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('deepxiv', {
+const desktopApi = {
   bootstrap: () => ipcRenderer.invoke('bootstrap'),
   refreshStatus: () => ipcRenderer.invoke('status:refresh'),
   tokenStatus: () => ipcRenderer.invoke('token:status'),
@@ -37,4 +37,7 @@ contextBridge.exposeInMainWorld('deepxiv', {
     ipcRenderer.on('pdf:prefetch-status', listener);
     return () => ipcRenderer.removeListener('pdf:prefetch-status', listener);
   }
-});
+};
+
+contextBridge.exposeInMainWorld('ohMyPaper', desktopApi);
+contextBridge.exposeInMainWorld('deepxiv', desktopApi);

@@ -1,6 +1,6 @@
-# DeepXiv Client
+# OhMyPaper
 
-这是一个基于 **Electron + React + Vite + Python bridge** 的 DeepXiv 桌面客户端项目，面向论文搜索、阅读、收藏、本地 PDF 管理与 AI 论文助手场景。
+这是一个基于 **Electron + React + Vite + Python bridge** 的论文桌面客户端项目，面向论文搜索、阅读、收藏、本地 PDF 管理与 AI 论文助手场景。
 
 > [!IMPORTANT]
 > **本项目是一个纯 Vibe Coding 产物。**
@@ -14,7 +14,7 @@
 推荐按下面的顺序开始使用：
 
 1. **先进行匿名注册**
-   - 打开应用后，先在设置页或连接区域点击匿名注册，拿到可用的 DeepXiv Token。
+   - 打开应用后会自动匿名注册，拿到可用的连接 Token。
 2. **再配置 AI 助手**
    - 填写 AI Provider、模型和 `OPENAI_API_KEY` 等配置。
 3. **可以联系原作者获取 Key 体验卡**
@@ -26,7 +26,7 @@
 
 ## 致谢
 
-本项目的论文能力建立在 **DeepXiv 官方 SDK / 官方能力接口** 之上。
+OhMyPaper 的论文能力建立在 **DeepXiv 官方 SDK / 官方能力接口** 之上。
 
 - 特别感谢原仓库：`DeepXiv/deepxiv_sdk`
 - 原仓库链接：`https://github.com/DeepXiv/deepxiv_sdk`

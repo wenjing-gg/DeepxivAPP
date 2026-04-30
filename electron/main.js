@@ -23,6 +23,7 @@ const DEFAULT_AI_CONFIG = {
 };
 
 const AI_REASONING_LEVELS = new Set(['high', 'medium', 'low', 'minimal']);
+const LEGACY_APP_DATA_NAMES = ['DeepXiv Client', 'deepxiv-client'];
 let mainWindow = null;
 const pdfViewerWindows = new Set();
 const pdfPrefetchTasks = new Map();
@@ -38,7 +39,7 @@ const PDF_BROWSER_RESOLUTION_TIMEOUT_MS = 25000;
 const PDF_BROWSER_RESOLUTION_POLL_MS = 1200;
 const PDF_SIBLING_SEARCH_LIMIT = 12;
 const PDF_SIBLING_MAX_ATTEMPTS = 3;
-const PDF_DOCUMENT_PROTOCOL = 'deepxiv-pdf';
+const PDF_DOCUMENT_PROTOCOL = 'ohmypaper-pdf';
 let pdfDocumentProtocolRegistered = false;
 const RESTRICTED_DIRECT_PDF_HOSTS = new Set(['dl.acm.org', 'www.gbv.de', 'pubs.acs.org']);
 const WEAK_PDF_SOURCE_HOSTS = new Set([
@@ -88,8 +89,8 @@ function defaultAiConfigStatus(aiConfig = normalizeAiConfig()) {
 }
 
 function appRoot() {
-  if (process.env.DEEPXIV_PROJECT_ROOT) {
-    return process.env.DEEPXIV_PROJECT_ROOT;
+  if (process.env.OHMYPAPER_PROJECT_ROOT || process.env.DEEPXIV_PROJECT_ROOT) {
+    return process.env.OHMYPAPER_PROJECT_ROOT || process.env.DEEPXIV_PROJECT_ROOT;
   }
   if (app.isPackaged) {
     return process.resourcesPath;
@@ -100,6 +101,7 @@ function appRoot() {
 function pythonCandidates() {
   const root = appRoot();
   return [
+    process.env.OHMYPAPER_PYTHON,
     process.env.DEEPXIV_PYTHON,
     path.join(root, '.venv', 'Scripts', 'python.exe'),
     path.join(root, '.venv', 'Scripts', 'python3.exe'),
@@ -116,8 +118,8 @@ function pythonCandidates() {
 function bundledBridgeCandidates() {
   const bridgeDir = path.join(appRoot(), 'bridge');
   return process.platform === 'win32'
-    ? [path.join(bridgeDir, 'deepxiv-bridge.exe')]
-    : [path.join(bridgeDir, 'deepxiv-bridge')];
+    ? [path.join(bridgeDir, 'ohmypaper-bridge.exe'), path.join(bridgeDir, 'deepxiv-bridge.exe')]
+    : [path.join(bridgeDir, 'ohmypaper-bridge'), path.join(bridgeDir, 'deepxiv-bridge')];
 }
 
 function bridgePath() {
@@ -1882,7 +1884,7 @@ async function resolvePdfViaBrowserSession({
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      partition: `persist:deepxiv-pdf-resolver`,
+      partition: `persist:ohmypaper-pdf-resolver`,
     },
   });
 
@@ -2170,12 +2172,12 @@ function clampPdfProgress(value) {
 function pdfFetchHeaders(candidate) {
   if (candidate?.kind === 'landing_page') {
     return {
-      'User-Agent': `DeepXiv Client/${app.getVersion()}`,
+      'User-Agent': `OhMyPaper/${app.getVersion()}`,
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
     };
   }
   return {
-    'User-Agent': `DeepXiv Client/${app.getVersion()}`,
+    'User-Agent': `OhMyPaper/${app.getVersion()}`,
     'Accept': 'application/pdf,application/octet-stream;q=0.9,text/html;q=0.6,*/*;q=0.5',
   };
 }
@@ -3233,22 +3235,36 @@ function statePath() {
   return path.join(app.getPath('userData'), 'state.json');
 }
 
+function legacyStatePaths() {
+  const currentPath = statePath();
+  const appDataRoot = app.getPath('appData');
+  return LEGACY_APP_DATA_NAMES
+    .map((name) => path.join(appDataRoot, name, 'state.json'))
+    .filter((candidate, index, items) => candidate !== currentPath && items.indexOf(candidate) === index);
+}
+
 async function readState() {
-  try {
-    const content = await fsp.readFile(statePath(), 'utf-8');
-    const payload = JSON.parse(content);
-    const favoriteGroups = normalizeFavoriteGroupsMap(payload.favoriteGroups || {});
-    const aiConfig = normalizeAiConfig(payload.aiConfig || {});
-    return {
-      favorites: normalizeFavoritesMap(payload.favorites || {}, favoriteGroups),
-      favoriteGroups,
-      history: payload.history || [],
-      aiConfig,
-      aiConfigStatus: normalizeAiConfigStatus(payload.aiConfigStatus || {}, aiConfig),
-    };
-  } catch (error) {
-    return defaultState();
+  for (const candidate of [statePath(), ...legacyStatePaths()]) {
+    try {
+      const content = await fsp.readFile(candidate, 'utf-8');
+      const payload = JSON.parse(content);
+      const favoriteGroups = normalizeFavoriteGroupsMap(payload.favoriteGroups || {});
+      const aiConfig = normalizeAiConfig(payload.aiConfig || {});
+      const normalized = {
+        favorites: normalizeFavoritesMap(payload.favorites || {}, favoriteGroups),
+        favoriteGroups,
+        history: payload.history || [],
+        aiConfig,
+        aiConfigStatus: normalizeAiConfigStatus(payload.aiConfigStatus || {}, aiConfig),
+      };
+      if (candidate !== statePath()) {
+        await writeState(normalized);
+      }
+      return normalized;
+    } catch (error) {
+    }
   }
+  return defaultState();
 }
 
 async function writeState(state) {
@@ -3479,7 +3495,7 @@ async function callAi(payload = {}) {
         model: aiConfig.model,
         store: !aiConfig.disableResponseStorage,
         reasoning: { effort: aiConfig.modelReasoningEffort },
-        instructions: 'You are DeepXiv 的论文阅读助手。默认使用中文回答，优先依据随附 PDF 内容，其次参考论文元信息。回答应准确、简洁，并在不确定时明确说明。',
+        instructions: 'You are OhMyPaper 的论文阅读助手。默认使用中文回答，优先依据随附 PDF 内容，其次参考论文元信息。回答应准确、简洁，并在不确定时明确说明。',
         input,
       }, 120000);
 
@@ -3652,7 +3668,7 @@ function createWindow() {
     height: 960,
     minWidth: 1200,
     minHeight: 800,
-    title: 'DeepXiv Mac Client',
+    title: 'OhMyPaper',
     backgroundColor: '#0f172a',
     webPreferences: {
       contextIsolation: true,

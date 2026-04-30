@@ -1,11 +1,11 @@
 {
-  "name": "deepxiv-client",
+  "name": "ohmypaper",
   "version": "2.0.2",
-  "description": "DeepXiv cross-platform desktop client built with Electron and the official Python SDK",
+  "description": "OhMyPaper cross-platform desktop client built with Electron and the DeepXiv official Python SDK",
   "author": "wenjing-gg",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wenjing-gg/DeepxivAPP.git"
+    "url": "git+https://github.com/wenjing-gg/OhMyPaper.git"
   },
   "main": "electron/main.js",
   "scripts": {
@@ -22,8 +22,8 @@
     "dist:win": "npm run bridge:build && npm run renderer:build && electron-builder --win nsis --x64 --publish never"
   },
   "build": {
-    "appId": "cn.rag.deepxiv.client",
-    "productName": "DeepXiv Client",
+    "appId": "cn.rag.ohmypaper.client",
+    "productName": "OhMyPaper",
     "asar": true,
     "asarUnpack": [
       "renderer/dist/assets/pdf.worker.min-*.mjs"

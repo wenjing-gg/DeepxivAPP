@@ -27,7 +27,7 @@ PY
 case "$PYTHON_VERSION" in
   3.10|3.11|3.12|3.13) ;;
   *)
-    echo "当前 Python 版本为 $PYTHON_VERSION，DeepXiv 运行环境要求 Python 3.10+" >&2
+    echo "当前 Python 版本为 $PYTHON_VERSION，OhMyPaper 运行环境要求 Python 3.10+" >&2
     exit 1
     ;;
 esac

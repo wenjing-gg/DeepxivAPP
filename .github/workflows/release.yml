@@ -77,9 +77,9 @@ jobs:
         run: |
           export HOME="$RUNNER_TEMP/deepxiv-home-bundled"
           mkdir -p "$HOME"
-          ./bridge-dist/deepxiv-bridge token-status '{}'
-          ./bridge-dist/deepxiv-bridge save-token '{"token":"ci-bundled-token"}'
-          ./bridge-dist/deepxiv-bridge token-status '{}'
+          ./bridge-dist/ohmypaper-bridge token-status '{}'
+          ./bridge-dist/ohmypaper-bridge save-token '{"token":"ci-bundled-token"}'
+          ./bridge-dist/ohmypaper-bridge token-status '{}'
 
       - name: Smoke test bridge Unicode output (macOS)
         if: runner.os != 'Windows'
@@ -118,9 +118,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\deepxiv-home-bundled" | Out-Null
           $env:HOME = "$env:RUNNER_TEMP\deepxiv-home-bundled"
-          .\bridge-dist\deepxiv-bridge.exe token-status '{}'
-          .\bridge-dist\deepxiv-bridge.exe save-token '{"token":"ci-bundled-token"}'
-          .\bridge-dist\deepxiv-bridge.exe token-status '{}'
+          .\bridge-dist\ohmypaper-bridge.exe token-status '{}'
+          .\bridge-dist\ohmypaper-bridge.exe save-token '{"token":"ci-bundled-token"}'
+          .\bridge-dist\ohmypaper-bridge.exe token-status '{}'
 
       - name: Build release package
         run: npm run ${{ matrix.npm_script }}
@@ -129,9 +129,9 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          APP_PATH="$(find release -maxdepth 2 -name 'DeepXiv Client.app' -print -quit)"
+          APP_PATH="$(find release -maxdepth 2 -name 'OhMyPaper.app' -print -quit)"
           if [ -z "$APP_PATH" ]; then
-            echo "DeepXiv Client.app not found"
+            echo "OhMyPaper.app not found"
             exit 1
           fi
           APP_DIR="$(dirname "$APP_PATH")"

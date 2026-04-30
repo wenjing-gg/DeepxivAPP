@@ -40,7 +40,7 @@ function run() {
     '--clean',
     '--onefile',
     path.join(rootDir, 'python', 'bridge.py'),
-    '--name', 'deepxiv-bridge',
+    '--name', 'ohmypaper-bridge',
     '--hidden-import', 'deepxiv_sdk.cli',
     '--hidden-import', 'deepxiv_sdk.reader',
     '--hidden-import', 'click',

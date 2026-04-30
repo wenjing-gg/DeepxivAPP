@@ -217,7 +217,7 @@ def register_token_via_resolved_ip(payload: Dict[str, Any]) -> Dict[str, Any]:
                     request = (
                         f"POST {path} HTTP/1.1\r\n"
                         f"Host: {host}\r\n"
-                        "User-Agent: DeepXiv-Desktop/1.0\r\n"
+                        "User-Agent: OhMyPaper/1.0\r\n"
                         "Accept: application/json\r\n"
                         "Content-Type: application/json\r\n"
                         f"Content-Length: {len(body)}\r\n"
@@ -284,7 +284,7 @@ def make_reader() -> Reader:
 def http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     query = urlencode({key: value for key, value in (params or {}).items() if value not in (None, "")}, doseq=True)
     full_url = f"{url}?{query}" if query else url
-    request = Request(full_url, headers={"User-Agent": "DeepXiv-Mac-Client/1.0"})
+    request = Request(full_url, headers={"User-Agent": "OhMyPaper/1.0"})
     try:
         with urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -1251,7 +1251,7 @@ def fetch_pmc_oa_package_url(pmcid: str) -> str:
         PMC_OA_SERVICE_URL,
         params={"id": pmcid},
         timeout=HTTP_TIMEOUT,
-        headers={"User-Agent": "DeepXiv Client"},
+        headers={"User-Agent": "OhMyPaper"},
     )
     response.raise_for_status()
     root = ElementTree.fromstring(response.text)
@@ -1299,7 +1299,7 @@ def cmd_cache_pmc_pdf(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     package_url = fetch_pmc_oa_package_url(pmcid)
     download_url = normalize_pmc_oa_download_url(package_url)
-    response = requests.get(download_url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "DeepXiv Client"})
+    response = requests.get(download_url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "OhMyPaper"})
     response.raise_for_status()
     package_bytes = response.content
 
